@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">SU2 icing research framework</div>
+      <h1>How the icing solver works</h1>
+      <p class="lede">A guided tour of the two-dimensional aircraft icing solver in this repository, from the
+        physics of a supercooled droplet to the code that refines a mesh around a growing ice horn. Every
+        figure is drawn from the solver's own code or from real saved runs.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/overview_rg15_iced.png" alt="RG-15 airfoil with computed ice on the leading edge"></div>
+        <figcaption>Computed ice on the RG-15 airfoil after 830 s of a 1200 s icing campaign (case 3.2,
+          25 m/s, −4 °C). From <code>runs/nibi/glz81_32</code>.</figcaption>
+      </figure>
+
+      <h2>How to read this guide</h2>
+      <p>The pages follow one trip round the solver's loop, in the order the code runs it. Each page starts
+        with the idea in plain words (<span class="level basic">Basic</span>). It then explains how the solver
+        does it (<span class="level intermediate">Intermediate</span>) and ends with the equations, code
+        excerpts and edge cases (<span class="level advanced">Advanced</span>). On a first pass, read the
+        basic sections of every page. Then come back for the deeper sections.</p>
+      <p>Four kinds of boxes recur:</p>
+      <div class="callout plain"><div class="callout-title">In plain words</div><p>A short summary to hold on to.</p></div>
+      <div class="callout why"><div class="callout-title">Why it is done this way</div><p>The reasoning, or the past failure, behind a design choice.</p></div>
+      <div class="callout code"><div class="callout-title">Where it lives</div><p>The files and functions to open in the repository.</p></div>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div><p>What the model leaves out, and what has not been proven.</p></div>
+
+      <h2>Start here</h2>
+      <div class="cards">
+        <a class="card" href="overview.html"><div class="card-num">1</div><h3>The big picture</h3><p>The icing loop, the three clocks, the two ice models, and how the code is laid out.</p></a>
+        <a class="card" href="basics.html"><div class="card-num">2</div><h3>Icing physics in plain words</h3><p>Supercooled clouds, collection efficiency, freezing fraction, rime versus glaze.</p></a>
+      </div>
+
+      <h2>One icing cycle, step by step</h2>
+      <div class="cards">
+        <a class="card" href="airflow.html"><div class="card-num">3</div><h3>Airflow with SU2</h3><p>RANS set-up, convergence gates, heat-transfer coefficient, warm starts, roughness.</p></a>
+        <a class="card" href="droplets.html"><div class="card-num">4</div><h3>Droplets and collection</h3><p>Trajectories, β, size bins, inlet audits and seed refinement.</p></a>
+        <a class="card" href="thermo.html"><div class="card-num">5</div><h3>The freezing energy balance</h3><p>Messinger control volume, rime and glaze branches, evaporation.</p></a>
+        <a class="card" href="film.html"><div class="card-num">6</div><h3>Water film and runback</h3><p>Thin-film flow driven by shear, pressure and gravity; exits.</p></a>
+        <a class="card" href="solid.html"><div class="card-num">7</div><h3>Heat inside the ice</h3><p>From slabs to a 2D conducting solid with phase change.</p></a>
+        <a class="card" href="growth.html"><div class="card-num">8</div><h3>Growing the ice surface</h3><p>Mass to shape: normals, corners, merging pockets, conservation.</p></a>
+        <a class="card" href="mesh.html"><div class="card-num">9</div><h3>Refining, deforming, remeshing</h3><p>Before-and-after meshes from real runs, and how the solver chooses.</p></a>
+      </div>
+
+      <h2>Advanced and reference</h2>
+      <div class="cards">
+        <a class="card" href="glaze.html"><div class="card-num">10</div><h3>Glaze: phase-aware ice</h3><p>Water held in the ice, melting, crusts and promotion to the wall.</p></a>
+        <a class="card" href="campaign.html"><div class="card-num">11</div><h3>Running a campaign</h3><p>Shots, sealed stages, restarts, the Nibi cluster.</p></a>
+        <a class="card" href="validation.html"><div class="card-num">12</div><h3>How we know it works</h3><p>Verification, benchmark comparisons and what is still open.</p></a>
+        <a class="card" href="code-map.html"><div class="card-num">13</div><h3>Code map</h3><p>Every module, grouped by job.</p></a>
+        <a class="card" href="glossary.html"><div class="card-num">14</div><h3>Glossary</h3><p>Terms and symbols in one place.</p></a>
+      </div>
+
+      <div class="callout limits"><div class="callout-title">About this guide</div>
+        <p>Written on 17 November 2026 from the code on <code>main</code> (latest commit <code>dc24dd2</code>)
+          and the saved runs in <code>runs/</code>. The code changes quickly. When a detail here disagrees with
+          the source or with <code>docs/</code>, trust the source. The figure scripts are in
+          <code>_build/</code> and can be rerun to refresh the figures.</p></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

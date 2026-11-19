@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airflow with SU2 · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 3 · Airflow with SU2</div>
+      <h1>Airflow with SU2</h1>
+      <p class="lede">Every icing shot starts with a flow solution. The open-source CFD code SU2 computes the air around the
+        current (clean or iced) body, and the icing solver reads back four things from it: wall pressure, wall shear,
+        a heat-transfer coefficient and the velocity field the droplets fly through. This page explains how that solve is set
+        up, how the solver decides a CFD answer is good enough to use, and how the numbers are turned into icing inputs.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#why">Why the icing solver needs the airflow</a> <span class="level basic">Basic</span></li>
+          <li><a href="#setup">What SU2 solves and how it is set up</a> <span class="level basic">Basic</span></li>
+          <li><a href="#fields">What comes back: the wall fields</a> <span class="level basic">Basic</span></li>
+          <li><a href="#htc">The heat-transfer coefficient and the recovery temperature</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#units">Units: nondimensionalization and output scaling</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#gates">When is a CFD solution good enough?</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#start">Starting a solve: cold, first-order, restart, warm start</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#force">The wall-force diagnostic</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#rough">Rough ice walls</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#code">In the code</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="why">Why the icing solver needs the airflow <span class="level basic">Basic</span></h2>
+      <p>Ice grows where water arrives and where heat can be taken away fast enough to freeze it. Both depend on the air:</p>
+      <ul>
+        <li><strong>Velocity field.</strong> Droplets are carried by the air. Small ones follow it around the body; large ones
+          cannot turn and hit the wall. The <a href="droplets.html">droplet step</a> integrates droplet paths through the CFD velocity
+          field, so the velocity field decides <em>where</em> and <em>how much</em> water is collected.</li>
+        <li><strong>Heat-transfer coefficient (HTC), \(h\).</strong> The air removes heat from the wet or icy surface by
+          convection. The <a href="thermo.html">energy balance</a> uses \(h\) to compute that cooling. A higher \(h\) means faster
+          freezing.</li>
+        <li><strong>Wall shear stress, \(\tau\).</strong> The air drags the unfrozen water film along the surface. The
+          <a href="film.html">film step</a> uses \(\tau\) to move runback water.</li>
+        <li><strong>Wall pressure, \(p\).</strong> The pressure gradient along the wall also pushes the film, and the local
+          pressure gives a local recovery (adiabatic-wall) temperature when that option is on.</li>
+      </ul>
+      <p>The airflow is solved on a fixed geometry, then held constant while ice grows for a "shot" of exposure time (for
+        example 200 s). After the shot the geometry has changed, so the mesh is updated (<a href="mesh.html">Step 9</a>) and the
+        airflow is solved again. This is the usual multi-shot (quasi-steady) approach.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 900 330" role="img" aria-label="Pipeline from SU2 inputs to wall fields and droplet velocity field">
+            <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <rect class="d-box" x="15" y="40" width="170" height="110" rx="10"/>
+            <text class="d-text" x="100" y="68" text-anchor="middle" font-weight="700">Inputs</text>
+            <text class="d-muted" x="100" y="92" text-anchor="middle">mesh.su2 (current body)</text>
+            <text class="d-muted" x="100" y="112" text-anchor="middle">flow.cfg (flow_config)</text>
+            <text class="d-muted" x="100" y="132" text-anchor="middle">restart / warm seed</text>
+            <rect class="d-accent" x="235" y="55" width="150" height="80" rx="10"/>
+            <text class="d-text" x="310" y="88" text-anchor="middle" font-weight="700">SU2_CFD</text>
+            <text class="d-muted" x="310" y="110" text-anchor="middle">INC_RANS, SST/SA</text>
+            <rect class="d-box" x="435" y="20" width="190" height="150" rx="10"/>
+            <text class="d-text" x="530" y="46" text-anchor="middle" font-weight="700">Outputs</text>
+            <text class="d-muted" x="530" y="70" text-anchor="middle">history.csv (residuals, CL, CD)</text>
+            <text class="d-muted" x="530" y="92" text-anchor="middle">surface_flow.vtu (wall)</text>
+            <text class="d-muted" x="530" y="114" text-anchor="middle">flow.vtu (volume)</text>
+            <text class="d-muted" x="530" y="136" text-anchor="middle">restart_flow.dat</text>
+            <text class="d-muted" x="530" y="158" text-anchor="middle">execution.json (hashes)</text>
+            <rect class="d-warm" x="675" y="20" width="210" height="70" rx="10"/>
+            <text class="d-text" x="780" y="48" text-anchor="middle" font-weight="700">Acceptance gates</text>
+            <text class="d-muted" x="780" y="70" text-anchor="middle">residuals, loads, T screen, HTC</text>
+            <rect class="d-ok" x="675" y="120" width="210" height="95" rx="10"/>
+            <text class="d-text" x="780" y="146" text-anchor="middle" font-weight="700">wall_fields()</text>
+            <text class="d-muted" x="780" y="168" text-anchor="middle">Pressure_nodes, Cp, shear</text>
+            <text class="d-muted" x="780" y="188" text-anchor="middle">htc, Y_Plus_node_max</text>
+            <rect class="d-ok" x="435" y="235" width="190" height="70" rx="10"/>
+            <text class="d-text" x="530" y="262" text-anchor="middle" font-weight="700">VTKVelocityField</text>
+            <text class="d-muted" x="530" y="284" text-anchor="middle">velocity × U (scaled)</text>
+            <rect class="d-box" x="675" y="245" width="210" height="60" rx="10"/>
+            <text class="d-text" x="780" y="270" text-anchor="middle">droplets, film, energy,</text>
+            <text class="d-text" x="780" y="290" text-anchor="middle">mesh y⁺ target</text>
+            <path class="d-arrow" d="M185 95 L233 95" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M385 95 L433 95" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M625 60 L673 55" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M780 90 L780 118" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M530 170 L530 233" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M625 270 L673 273" marker-end="url(#ah)"/>
+            <path class="d-arrow" d="M780 215 L780 243" marker-end="url(#ah)"/>
+            <circle cx="210" cy="78" r="11" fill="var(--warm)"/><text x="210" y="82" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">1</text>
+            <circle cx="650" cy="40" r="11" fill="var(--warm)"/><text x="650" y="44" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">2</text>
+            <circle cx="805" cy="105" r="11" fill="var(--warm)"/><text x="805" y="109" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">3</text>
+            <circle cx="555" cy="205" r="11" fill="var(--warm)"/><text x="555" y="209" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">4</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 1.</b> One CFD refresh. (1) The configuration is written by <code>icing.su2.flow_config</code>
+          (or, in campaigns, from a frozen template file). (2) Nothing is used before the acceptance gates pass. (3) The wall
+          fields are read back by coordinate matching in <code>icing.fields.wall_fields</code>. (4) The volume field becomes the
+          droplet velocity field, rescaled to m/s.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>SU2 is the solver's wind tunnel. It runs on the current shape, the icing code checks that the answer has settled,
+          then reads off "how hard the air pushes and rubs on the wall" (pressure and shear), "how fast the air cools the wall"
+          (HTC) and "where the air goes" (velocity). These are frozen for the next stretch of ice growth.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="setup">What SU2 solves and how it is set up <span class="level basic">Basic</span></h2>
+      <p>SU2 solves the steady, <strong>incompressible Reynolds-averaged Navier–Stokes (RANS)</strong> equations
+        (<code>SOLVER= INC_RANS</code>) with constant density and constant viscosity. "Reynolds-averaged" means turbulence
+        is not resolved; its average effect is modelled by a turbulence model. Two are allowed
+        (<code>FlowConditions.validate</code> in <code>icing/su2.py</code>):</p>
+      <ul>
+        <li><strong>SA</strong> (Spalart–Allmaras, one extra equation for a turbulent viscosity variable), and</li>
+        <li><strong>SST</strong> (Menter's k–ω SST, two equations: turbulent kinetic energy \(k\) and specific dissipation \(\omega\)).
+          SST is the default and is required for rough walls.</li>
+      </ul>
+      <p>With SST, the <strong>Langtry–Menter (LM)</strong> transition model can be switched on (<code>transition: "LM"</code>).
+        It adds two more equations and lets the boundary layer start laminar and become turbulent. Without it the flow is
+        "fully turbulent" from the stagnation point.</p>
+      <p>An <strong>energy equation</strong> is also solved (<code>INC_ENERGY_EQUATION= YES</code>). The wall is given a fixed
+        temperature (<code>MARKER_ISOTHERMAL</code>), a little warmer than the air. That temperature difference is what lets the
+        solver measure a heat-transfer coefficient (next sections). Laminar and turbulent Prandtl numbers are 0.72 and 0.9.</p>
+      <p>The incompressible model is only allowed below a freestream Mach number of 0.3: <code>validate()</code> raises
+        <code>'Incompressible backend restricted to Mach &lt; 0.3'</code> otherwise. The real RG-15 cases on this site run at
+        25 m/s (Mach about 0.08).</p>
+
+<pre><code class="language-python">settings={
+    'SOLVER':'INC_RANS','KIND_TURB_MODEL':flow.turbulence,'KIND_TRANS_MODEL':flow.transition,
+    'INC_DENSITY_MODEL':'CONSTANT','INC_DENSITY_INIT':flow.density,
+    'INC_VELOCITY_INIT':f'({u:.16g}, {v:.16g}, 0)','INC_TEMPERATURE_INIT':flow.temperature,
+    'INC_ENERGY_EQUATION':'YES','INC_NONDIM':flow.nondimensionalization,
+    'VISCOSITY_MODEL':'CONSTANT_VISCOSITY','MU_CONSTANT':flow.viscosity,
+    'PRANDTL_LAM':.72,'PRANDTL_TURB':.9,
+    'MARKER_ISOTHERMAL':f'({wall}, {flow.wall_temperature})','MARKER_FAR':f'({far})',
+    'CFL_NUMBER':numerics.cfl,'CONV_NUM_METHOD_FLOW':'FDS',
+    'MUSCL_FLOW':'YES' if numerics.muscl else 'NO','SLOPE_LIMITER_FLOW':'VENKATAKRISHNAN',
+    'OUTPUT_FILES':'(RESTART, PARAVIEW, SURFACE_PARAVIEW)',
+    'HISTORY_OUTPUT':'(ITER, RMS_RES, AERO_COEFF)', ...
+}</code></pre>
+      <div class="code-src">icing/su2.py, flow_config() (simplified)</div>
+      <p>This dictionary is written line by line as <code>KEY= value</code> into <code>flow.cfg</code> by
+        <code>write_config()</code>. Note what is fixed: a flux-difference-splitting scheme (<code>FDS</code>),
+        second-order reconstruction (<code>MUSCL</code>) with the Venkatakrishnan limiter, implicit pseudo-time stepping at a fixed
+        CFL number, and output of the restart, the volume and surface ParaView files, and a CSV history of residuals and force
+        coefficients.</p>
+      <p>The physical inputs live in the <code>FlowConditions</code> dataclass: speed, angle of attack, static temperature,
+        density, viscosity, chord, turbulence and transition model, turbulence intensity (default 0.1 %), wall temperature
+        (default 273.15 K) and the roughness options. The numerical knobs (CFL, MUSCL on/off, linear-solver iterations and
+        tolerance, output frequency) are in a separate dataclass, <code>FlowNumerics</code>. Keeping them apart matters:
+        <code>MODELS.md</code> warns that changing viscosity to "help" a normalized geometry would change the droplet Stokes number
+        and the heat transfer.</p>
+
+      <div class="callout why"><div class="callout-title">Why it is done this way</div>
+        <p>Campaigns on the cluster (RG-15 glaze runs) do not call <code>flow_config</code> directly; they copy a frozen
+          template (<code>template_31.cfg</code>) into every CFD block and change only <code>RESTART_SOL</code>, <code>ITER</code>,
+          <code>CONV_STARTITER</code> and <code>MUSCL_FLOW</code> (<code>icing.campaign.run_cfd</code>). That template adds the
+          wind-tunnel boundaries of the RG-15 test (velocity inlet, pressure outlet, symmetry tunnel walls) and the uniform
+          0.5 mm wall roughness. Freezing the template makes every block of every shot use byte-identical settings, which the
+          SHA-256 receipts can prove later.</p></div>
+
+      <h3>Who launches SU2</h3>
+      <p><code>run_executable()</code> starts the solver as a subprocess, optionally under MPI (<code>mpiexec</code> or
+        <code>srun</code>). Before launch it writes <code>launch.json</code>; after exit it writes <code>execution.json</code>
+        with the SHA-256 hashes of the executable and of <code>flow.cfg</code>, the thread and rank counts, the elapsed time and
+        the return code. A cluster fault where <code>srun</code> starts no task at all (seen on Nibi, "started 0 of 16 tasks")
+        is detected by <code>launch_failed()</code>: no SU2 banner in the log plus a known launcher message. It raises
+        <code>LaunchFailure</code>, deliberately not a <code>RuntimeError</code>, so that numerical fallbacks are not triggered by an
+        infrastructure fault.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="fields">What comes back: the wall fields <span class="level basic">Basic</span></h2>
+      <p>SU2 writes the wall solution to <code>surface_flow.vtu</code>. The icing solver does not trust the order of points in
+        that file. Instead <code>sample_wall_fields()</code> builds a k-d tree of the file's coordinates and finds, for every
+        vertex of the icing surface, the matching CFD node. The match must be within \(\max(10^{-9}\,\mathrm{m},\ 2\times10^{-6}c)\)
+        and one-to-one, otherwise the read fails with <code>'CFD surface does not match current icing surface'</code>.
+        Nodal values are then averaged to panels (each panel takes the mean of its two end nodes), except two quantities that are
+        kept at nodes: <code>Pressure_nodes</code> (needed by the nodal film coupling) and the maximum nodal \(y^+\).</p>
+
+      <figure>
+        <div class="frame"><img src="figures/airflow_le_htc_geometry.png" alt="Leading edge of the RG-15 airfoil, clean and iced, with the wall coloured by heat-transfer coefficient"></div>
+        <figcaption><b>Figure 2.</b> The HTC read back from two accepted SU2 solutions of RG-15 case 3.1 (glaze, 25 m/s,
+          \(T_\infty=271.15\) K). Left: shot 1 on the clean airfoil. Right: shot 7, on the ice shape reached at 1030 s; the dashed
+          line is the clean airfoil. (1) The stagnation point, taken as the node of maximum pressure. (2) The HTC peak: 447
+          W/(m² K) clean, 716 W/(m² K) iced, where the ice nose is sharpest. (3) The ice horns and steps: the HTC drops to almost
+          zero in the pockets behind them (the lowest panel value is 0.52 W/(m² K)). Data:
+          <code>runs/nibi/glz81_31/analysis_inputs/package/results_31/shot_0{1,7}</code>; script
+          <code>_build/fig_airflow.py</code>.</figcaption>
+      </figure>
+
+      <figure>
+        <div class="frame"><img src="figures/airflow_wall_profiles.png" alt="Cp, wall shear, HTC and y+ along the surface near the leading edge, clean and iced"></div>
+        <figcaption><b>Figure 3.</b> The same two solutions as profiles along the surface distance \(s\) from the stagnation
+          point (upper surface positive). (1) Stagnation: \(C_p\approx 1\) and the shear changes sign. (2) The suction peak moves
+          and sharpens on the iced shape: \(C_p\) reaches −2.07 (clean: −1.30). (3) Negative shear means the near-wall flow runs
+          back toward the stagnation point: separated pockets behind the ice features, between about 3 and 9 mm and again
+          from about 20 to 31 mm on the upper side. The film model sees this directly. (4) HTC peaks just past stagnation; the
+          iced profile is much more jagged because the ice surface is. Bottom: the nodal \(y^+\) stays below the SU2 backend's
+          limit of 2 (maximum 1.32 clean, 1.56 iced). The jagged iced curves are real solver output on a jagged ice surface, not
+          plotting noise; whether they are mesh-converged is not established.</figcaption>
+      </figure>
+
+      <p>The extraction code is short. The wall shear the icing model uses is the component of SU2's skin-friction vector
+        along the panel tangent, made dimensional with the dynamic pressure:</p>
+<pre><code class="language-python">def dimensionalize_mechanical(data,surface,flow):
+    data['Pressure']*=flow.output_scales['pressure']
+    if 'Pressure_nodes' in data:
+        data['Pressure_nodes']*=flow.output_scales['pressure']
+    cf=data['Skin_Friction_Coefficient']
+    data['shear']=np.sum(cf[:,:2]*surface.tangents,axis=1)*.5*flow.density*flow.speed**2
+    return data</code></pre>
+      <div class="code-src">icing/fields.py, dimensionalize_mechanical() (validation lines removed)</div>
+      $$\tau_i = \tfrac12\rho_\infty U_\infty^2\;\mathbf C_{f,i}\cdot\mathbf t_i$$
+      <p>Here \(\mathbf C_{f,i}\) is the panel-mean skin-friction vector and \(\mathbf t_i\) the unit tangent of panel \(i\)
+        (counter-clockwise along the surface). Its sign therefore says which way the air rubs the wall.</p>
+      <p>There is also <code>wall_mechanical_fields()</code>, which reads only pressure, \(C_p\), \(C_f\), shear and \(y^+\).
+        It works on <em>adiabatic</em> solutions that have no meaningful heat flux, and never infers an HTC from them.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="htc">The heat-transfer coefficient and the recovery temperature <span class="level intermediate">Intermediate</span></h2>
+      <p>The HTC is defined by a simple "probe" experiment done inside the CFD. The wall is held at a fixed temperature
+        \(T_w\) slightly above the air temperature \(T_\infty\) (2 K in RG-15 case 3.1: 273.15 K vs 271.15 K). SU2 then reports the
+        heat flux through each wall node. Dividing that flux by the imposed temperature difference gives the conductance of the
+        air layer:</p>
+      $$h = \frac{q_\text{probe}}{T_w - T_\infty}, \qquad q_\text{probe} = -\,\texttt{Heat\_Flux}_\text{SU2}$$
+      <p>The minus sign is a convention check: SU2 reports heat flowing from a hot wall into cold air as negative. The code
+        enforces both the convention and a usable temperature difference:</p>
+<pre><code class="language-python">data['Temperature']*=flow.output_scales['temperature']
+delta=flow.wall_temperature-flow.temperature
+if delta&lt;=.5:
+    raise ValueError('Isothermal HTC probe needs Twall at least 0.5 K above Tinf')
+data['htc']=-data['Heat_Flux']/delta
+if np.any(data['htc']&lt;=0):
+    raise ValueError('Nonpositive CFD HTC: check convergence and heat-flux convention')</code></pre>
+      <div class="code-src">icing/fields.py, wall_fields()</div>
+
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 900 300" role="img" aria-label="Definition of the HTC from an isothermal-wall probe and its use in the icing energy balance">
+            <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--warm)"/></marker></defs>
+            <text class="d-text" x="215" y="28" text-anchor="middle" font-weight="700">In SU2: the probe</text>
+            <rect class="d-warm" x="40" y="215" width="350" height="40" rx="6"/>
+            <text class="d-text" x="215" y="241" text-anchor="middle">wall held at T_w = 273.15 K</text>
+            <text class="d-muted" x="215" y="62" text-anchor="middle">air at T_∞ = 271.15 K, U = 25 m/s →</text>
+            <path d="M60 205 C 120 160, 200 150, 380 140" class="d-line"/>
+            <text class="d-muted" x="300" y="128">thermal boundary layer</text>
+            <path class="d-arrow" style="stroke:var(--warm)" d="M140 212 L140 160" marker-end="url(#ah2)"/>
+            <path class="d-arrow" style="stroke:var(--warm)" d="M215 212 L215 165" marker-end="url(#ah2)"/>
+            <path class="d-arrow" style="stroke:var(--warm)" d="M290 212 L290 170" marker-end="url(#ah2)"/>
+            <text class="d-text" x="215" y="100" text-anchor="middle">q_probe = −Heat_Flux (W/m²)</text>
+            <text class="d-text" x="215" y="285" text-anchor="middle" font-weight="700">h = q_probe / (T_w − T_∞)</text>
+            <line x1="450" y1="20" x2="450" y2="290" class="d-line" stroke-dasharray="5 5"/>
+            <text class="d-text" x="675" y="28" text-anchor="middle" font-weight="700">In the icing model: reuse h</text>
+            <rect class="d-ok" x="490" y="55" width="370" height="60" rx="8"/>
+            <text class="d-text" x="675" y="80" text-anchor="middle">static convection  q_static = h (T_s − T_∞)</text>
+            <text class="d-muted" x="675" y="102" text-anchor="middle">T_s = actual ice / water surface temperature</text>
+            <rect class="d-accent" x="490" y="130" width="370" height="60" rx="8"/>
+            <text class="d-text" x="675" y="155" text-anchor="middle">recovery heating  q_rec = h · r U² / (2 c_p)</text>
+            <text class="d-muted" x="675" y="177" text-anchor="middle">added separately, r = 0.85 by default</text>
+            <rect class="d-box" x="490" y="205" width="370" height="60" rx="8"/>
+            <text class="d-text" x="675" y="230" text-anchor="middle">net cooling = q_static − q_rec</text>
+            <text class="d-muted" x="675" y="252" text-anchor="middle">= h (T_s − T_rec); h itself is never rescaled</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 4.</b> Left: the HTC is measured in SU2 with a slightly warm isothermal wall. Right: the
+          <a href="thermo.html">energy balance</a> reuses that \(h\) with the real surface temperature and adds the
+          aerodynamic (recovery) heating as a separate term. Source: <code>docs/HEAT_TRANSFER_CONTRACT.md</code>.</figcaption>
+      </figure>
+
+      <h3>Why the recovery temperature is added outside the CFD</h3>
+      <p>In fast air, friction in the boundary layer heats the air next to an insulated wall above the static temperature, to
+        the <em>recovery temperature</em> \(T_\text{rec} = T_\infty + r\,U_\infty^2/(2c_p)\). The heat-transfer contract records a
+        source review of SU2 v8.4.0: its constant-density incompressible energy equation carries thermal enthalpy with a
+        conduction flux and has <strong>no viscous-heating source</strong>. The CFD probe therefore contains no recovery
+        heating, and its \(h\) is referenced to the static inlet temperature. The icing model adds recovery heating as an
+        auditable separate term (<code>ThermalResult.static_reference_convection</code> and <code>recovery_heating</code>,
+        both in J/m span), using \(r = 0.85\) and \(c_p = 1005\) J/(kg K) by default. At 25 m/s this is
+        \(0.85\cdot 25^2/(2\cdot1005)\approx 0.26\) K.</p>
+      <p>The contract explicitly forbids the tempting shortcut of redefining \(h = q_\text{probe}/(T_w - T_\text{rec})\): that
+        would change the conductance (and, through the Lewis analogy, evaporation) just to make an augmented model reproduce an
+        unaugmented probe. An earlier algebraic screen, kept in the contract, quantified what the external term changes: at the
+        probe wall temperature, net cooling is 0.54 % lower for the George case and 13.2 % lower for an RG-15 glaze probe.</p>
+      <p>Campaigns can instead use a <em>local</em> recovery temperature from the shot's wall pressure
+        (<code>IcePolicy.local_recovery</code>, which calls <code>thermo.local_recovery_temperature</code>); RG-15 case 3.1 has it
+        switched on (<code>"local_recovery": true</code> in <code>campaign_31.json</code>).</p>
+
+      <div class="callout limits"><div class="callout-title">Assumptions and limits of the HTC</div>
+        <ul>
+          <li>It is a <strong>frozen-HTC</strong> approximation (<code>MODELS.md</code>): the real surface temperature, conjugate
+            conduction into the substrate, and thermal feedback on the flow are not in the CFD.</li>
+          <li>SU2 imposes the wall temperature weakly, so the wall-node temperature need not equal \(T_w\) exactly. The code uses
+            the prescribed \(T_w\). In case 3.1 shot 7 the largest mismatch was 0.025 K (<code>assessment.json</code>).</li>
+          <li>\(r = 0.85\) is an assumption, not measured; one isothermal snapshot does not prove the heat flux is linear in the
+            wall temperature.</li>
+          <li>The contract applies to SU2 8.4.0 incompressible solves only; compressible or modified solvers need their own.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="units">Units: nondimensionalization and output scaling <span class="level intermediate">Intermediate</span></h2>
+      <p>SU2 works internally in scaled ("nondimensional") variables. With the default <code>INC_NONDIM= INITIAL_VALUES</code>
+        the reference values are the initial freestream speed, density and temperature. The volume and surface files then
+        contain velocity, pressure and temperature in those solver units, while the wall <code>Heat_Flux</code> is already in
+        W/m². <code>FlowConditions.output_scales</code> encodes this contract and is saved as <code>output_scales.json</code> next
+        to every solve:</p>
+<pre><code class="language-python">@property
+def output_scales(self):
+    """SU2 exports primitive solution values in solver units, but heat flux in SI."""
+    if self.nondimensionalization=='DIMENSIONAL':
+        return {'velocity':1.,'pressure':1.,'temperature':1.,'heat_flux':1.}
+    return {'velocity':self.speed,'pressure':self.density*self.speed**2,
+            'temperature':self.temperature,'heat_flux':1.}</code></pre>
+      <div class="code-src">icing/su2.py, FlowConditions.output_scales</div>
+      <div class="facts">
+        <div class="fact"><div class="v">× 25</div><div class="k">velocity scale, m/s (RG-15 3.1)</div></div>
+        <div class="fact"><div class="v">× 813.4</div><div class="k">pressure scale \(\rho U^2\), Pa</div></div>
+        <div class="fact"><div class="v">× 271.15</div><div class="k">temperature scale, K</div></div>
+        <div class="fact"><div class="v">× 1</div><div class="k">heat flux (already W/m²)</div></div>
+      </div>
+      <p>\(C_p\), \(C_f\) and \(y^+\) are dimensionless and are not scaled. The pressure is the incompressible pressure relative
+        to its configured zero, not the absolute thermodynamic pressure. <code>MODELS.md</code> notes that "the heat-flux sign and
+        output field names are checked by executable probes"; the scaling contract is likewise covered by tests named in
+        <code>docs/VALIDATION.md</code> ("wall-field units and coordinate mapping").</p>
+
+      <div class="callout why"><div class="callout-title">Why it is done this way</div>
+        <p>A silent factor of \(U\) or \(\rho U^2\) is the easiest error to make when coupling codes, and it would not crash
+          anything. Writing the scales to a file and multiplying in exactly one place (<code>wall_fields</code>, and
+          <code>VTKVelocityField(velocity_scale=...)</code> for droplets) makes the contract checkable.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="gates">When is a CFD solution good enough? <span class="level intermediate">Intermediate</span></h2>
+      <p>A steady RANS solver iterates in "pseudo-time" toward a solution. It never says "done"; it only prints residuals
+        (how much the equations are still out of balance) and force coefficients. The icing solver has to decide when to stop and
+        whether to trust the answer. It never uses a CFD result that failed its gates: <code>run_flow</code> raises
+        <code>'Unconverged CFD; icing step rejected'</code>, and a campaign raises <code>'CFD cap reached without acceptance;
+        icing not started for this shot'</code>.</p>
+
+      <h3>Gate 1: the basic convergence window (all drivers)</h3>
+      <p><code>icing.su2.convergence()</code> looks at the last <code>window</code> iterations of <code>history.csv</code> and
+        accepts only if every exported residual and both force coefficients are settled:</p>
+<pre><code class="language-python">enough = len(history['CL']) >= window
+swings = {k:float(np.ptp(history[k][-window:])) for k in ('CL','CD')}
+worst = max(float(np.max(history[k][-window:])) for k in residuals)
+accepted = enough and worst <= residual_limit and max(swings.values()) <= force_tolerance</code></pre>
+      <div class="code-src">icing/su2.py, convergence()</div>
+      <p>The defaults are a 100-iteration window, all log₁₀ residuals ≤ −6, and CL/CD peak-to-peak ranges ≤ 10⁻⁴; the RG-15
+        nodal case uses a 2000-iteration window. When the flow model is known, the function also demands the residual columns
+        that model must produce (\(P, U, V\), energy as <code>rms[h]</code> or <code>rms[T]</code>, \(k, \omega\) for SST,
+        \(\tilde\nu\) for SA, two more for LM) and refuses a window whose iteration numbers are not consecutive (a hidden restart).
+        A steady limit cycle cannot pass, because the force ranges would be too large.</p>
+      <p><code>run_flow</code> adds two more conditions: the volume temperature screen and second order. The
+        <strong>temperature screen</strong> (<code>fields.volume_temperature_report</code>) checks every volume node stays inside
+        \([\min(T_\infty,T_w) - m,\ \max(T_\infty,T_w)+m]\) with \(m=\max(5\,\mathrm{K},\ \tfrac12|T_w-T_\infty|,\ U^2/(2\cdot1005))\);
+        for case 3.1 that is 266.15–278.15 K. And <code>report['accepted']</code> is forced false unless MUSCL was on:</p>
+<pre><code class="language-python">report['iteration_converged']=report['accepted']
+report['second_order_mean_flow']=numerics.muscl
+report['accepted']=bool(report['accepted'] and numerics.muscl)</code></pre>
+      <div class="code-src">icing/su2.py, run_flow()</div>
+
+      <h3>Gate 2: wall resolution, \(y^+\)</h3>
+      <p>\(y^+\) is the first-cell height in "wall units"; RANS wall treatment with SST needs it near 1. The legacy and nodal
+        controllers use <code>SU2Backend</code>, which rejects a solution whose maximum <em>nodal</em> \(y^+\) exceeds
+        <code>max_yplus</code> (default 2): <code>'Wall resolution rejected: max y+=...'</code>. The nodal maximum is used on
+        purpose: panel averaging could hide one under-resolved node (<code>MODELS.md</code>). Campaigns record \(y^+\) as
+        <code>yplus_policy: "monitor_only"</code> instead, and control it upstream: the remesher sizes the first cell from the
+        shot's wall shear for <code>target_yplus</code> (1.0 for RG-15) and a deformed mesh is rejected if its predicted
+        \(y^+ = u_\tau h_1/\nu\) leaves the band [0.1, 2] × target (<code>mesh_adaptation.deformation_checks</code>; see the
+        <a href="mesh.html">mesh page</a>).</p>
+
+      <h3>Gate 3: campaign blocks, loads and HTC stability</h3>
+      <p>Cluster campaigns (<code>icing/campaign.py</code>, <code>run_cfd</code>) do not run one long solve. They run a chain of
+        <strong>sealed restart blocks</strong>: a first block of 2000 iterations, then blocks of 10,000
+        (<code>CFDPolicy.first_block</code>, <code>block</code>). Each block lives in its own folder
+        (<code>block_0012000</code>, ...) with its mesh, config, history, outputs and restart, and is sealed by a
+        <code>done.json</code> listing SHA-256 hashes of every file plus an "anchor" (the seed's hash, start and end iteration,
+        order). A rerun resumes after the last sealed block; a block whose files changed, or whose anchor differs, is refused.</p>
+      <p>Every block gets an <code>assessment.json</code> (safety screens, recorded once) and a <code>gate.json</code>
+        (re-evaluated from the sealed files under the active policy, so an authorized gate revision applies to old blocks too).
+        <code>evaluate_block()</code> supports three modes:</p>
+      <div class="table-wrap"><table>
+        <tr><th>gate_mode</th><th>Residuals</th><th>Loads</th><th>Wall profiles</th></tr>
+        <tr><td><code>instantaneous</code></td><td>all ≤ <code>residual_limit</code> in the window</td><td>CL, CD ranges ≤ 0.002 / 0.0005</td><td>HTC change vs previous block</td></tr>
+        <tr><td><code>load_based</code></td><td>all but ω ≤ limit, ω ≤ −4</td><td>block-mean CL, CD change</td><td>HTC, shear, Cp</td></tr>
+        <tr><td><code>windowed</code></td><td>divergence guard only: no block-median log residual rises by &gt; 0.2 over 5 blocks</td><td>mean of the last 2 blocks vs the 2 before: CL ≤ 0.1 %, CD ≤ 0.5 %</td><td>window-mean HTC and shear ≤ 0.5 % integrated / 2 % peak; Cp ≤ 10 % / 10 %</td></tr>
+      </table></div>
+      <p>The numbers in the last row are the RG-15 glaze settings (<code>campaign_31.json</code>). The profile change is a
+        length-weighted relative L1 norm plus a peak check:</p>
+      $$\Delta_{L1} = \frac{\sum_i \ell_i\,|h_i^\text{new}-h_i^\text{old}|}{\sum_i \ell_i\,|h_i^\text{old}|},\qquad
+        \Delta_\text{peak} = \frac{\max_i |h_i^\text{new}-h_i^\text{old}|}{\max_i |h_i^\text{old}|}$$
+      <p>where \(\ell_i\) is the panel length (<code>_profile_change</code>). A block <em>qualifies</em> only if it is second
+        order, safe (temperature screen passed, finite positive HTC) and passes every check; the shot's CFD is accepted after
+        <code>consecutive = 2</code> qualified blocks in a row. Its final files are copied up into the shot's <code>flow/</code>
+        folder and sealed with <code>accepted_by: "gates"</code>. Integration pilots can switch gates off (<code>gates: false</code>)
+        and then stop at the iteration cap with <code>accepted_by: "pilot_cap"</code>.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/airflow_cfd_blocks.png" alt="Residuals, lift and gate checks across the CFD blocks of one campaign shot"></div>
+        <figcaption><b>Figure 5.</b> One accepted campaign solve: RG-15 case 3.2, shot 7 of run glz4_32, warm-started from shot 6
+          on a remeshed grid. The shaded first block (2000 iterations) is first order. The residuals flatten by about 10,000
+          iterations; the ω residual plateaus near −4.9 and would never meet a −6 limit, which is why the windowed mode treats
+          residuals only as a divergence guard. Bottom: the gate checks recorded in each block's <code>gate.json</code>. Window
+          averages need 4 safe second-order blocks, so the load check first runs at 42k, where the window-mean CL still changed
+          by −0.50 % (limit 0.1 %). At 52k and 62k everything passes (CL change −0.003 %, HTC change 4×10⁻⁷), giving two consecutive
+          qualified blocks: accepted at 62,000 iterations after 4,279 s of solver time
+          (<code>runs/nibi/glz4_32/results_32/shot_07/flow</code>).</figcaption>
+      </figure>
+
+      <h3>A cautionary example: a pseudo-time pressure mode</h3>
+      <p>Why so much machinery? Because an earlier set of glaze runs at CFL 0.2 never settled. The project's physics review
+        (<code>docs/PHYSICS_REVIEW.md</code>, entries of 2026-11-09) traced the problem step by step: a slowly decaying
+        pressure-only oscillation with a period of about 4,000 iterations, which scaled as 1/CFL. That scaling shows it lives in
+        pseudo-time, so it is a numerical artefact of the steady iteration, not flow physics. At CFL 5 it decayed with an
+        e-folding of about 1,500 iterations, and the end state agreed with the long CFL-0.2 averages (CL 0.6938 vs 0.694, wall heat
+        flux within 0.93 %). The later RG-15 templates use <code>CFL_NUMBER= 5.0</code>.</p>
+      <figure>
+        <div class="frame"><img src="figures/airflow_pseudotime_mode.png" alt="Long CL history at CFL 0.2 and a CFL comparison restarted from the same state"></div>
+        <figcaption><b>Figure 6.</b> Left: run glz2_31 shot 1 at CFL 0.2. CL every 25 iterations (light) and block means (dark)
+          over 652,000 iterations; the gates never accepted it (the HTC/shear check failed in every logged block near the end,
+          <code>icing-glz2_31-26605539.out</code>). Right: a local diagnostic restart from the 642k state with only the CFL
+          changed (<code>runs/diag_cfl_642k</code>): the period shrinks as the CFL grows, and only CFL 5 damps quickly. These are
+          integration checks, not validation.</figcaption>
+      </figure>
+      <div class="callout limits"><div class="callout-title">What the gates do not prove</div>
+        <ul>
+          <li>The tolerances measure <strong>iterative</strong> convergence of the icing inputs. They say nothing about mesh
+            (discretization) error or turbulence-model error. <code>PHYSICS_REVIEW.md</code> records an unexplained 17 % mesh
+            sensitivity of drag between two glaze meshes and a 9 % drag sensitivity to the limiter coefficient.</li>
+          <li>The windowed limits were calibrated on one mesh and one flow (the v1 glaze shot 1).</li>
+          <li>Every report carries <code>physical_validation: false</code>. Passing the gates is necessary, not sufficient.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="start">Starting a solve: cold, first-order, restart, warm start <span class="level intermediate">Intermediate</span></h2>
+      <p>How the iteration starts does not change the accepted answer (the gates decide that), but it changes the cost a lot.
+        The code has four ways to start, and it refuses to mix them (<code>run_flow</code> raises <code>'Choose either cold
+        first-order startup or an existing restart'</code> and <code>'A mapped warm start replaces both cold startup and an exact
+        restart'</code>).</p>
+      <ol class="steps">
+        <li><strong>Cold start.</strong> Uniform freestream initial values from <code>INC_*_INIT</code>.</li>
+        <li><strong>First-order startup.</strong> A short preliminary solve on the same mesh with MUSCL off and CFL at most 0.5
+          (<code>run_flow(startup_iterations=...)</code>), whose restart then seeds the second-order solve. It is never accepted
+          itself. Campaigns do the same with their first block after a remesh (<code>first_order_after_remesh = 2000</code>);
+          after a pure deformation the first block is already second order.</li>
+        <li><strong>Exact restart.</strong> Continue a previous iterate on the <em>identical</em> mesh.
+          <code>prepare_restart()</code> checks the mesh bytes, the flow conditions, the executable hash, the configuration hash and
+          each file's hash against the source's <code>artifacts.json</code>. Anything different is refused.</li>
+        <li><strong>Mapped warm start.</strong> Interpolate the previous shot's converged solution onto the new mesh
+          (<code>icing/su2_warm_start.py</code>, <code>map_restart_to_mesh</code>). This is the default for the next shot.</li>
+      </ol>
+
+      <h3>The warm start, and why it is wall-relative</h3>
+      <p>Away from the wall, each new node simply takes the linear (or bilinear) interpolant of the old cell that contains it.
+        Near the wall that would be wrong: ice growth has moved the wall outward by a gap \(g\) that can be comparable to the
+        boundary-layer thickness. Plain interpolation would put the old mid-boundary-layer velocity right at the new wall.
+        With <code>wall_relative=True</code>, a node at distance \(d\) from the new wall instead samples the old field at the same
+        distance \(d\) from the <em>old</em> wall, with the velocity rotated by the change of wall normal. The two mappings are
+        blended between \(d=2g\) and \(d=4g\):</p>
+      $$w(d) = \operatorname{clip}\!\left(\frac{4g-d}{2g},\,0,\,1\right),\qquad
+        \mathbf q_\text{new} = w\,\mathbf q_\text{wall-relative} + (1-w)\,\mathbf q_\text{direct}$$
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 900 280" role="img" aria-label="Wall-relative warm start mapping">
+            <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <rect x="40" y="220" width="820" height="40" fill="var(--surface-2)" stroke="var(--border)"/>
+            <text class="d-muted" x="60" y="245">old wall (previous shot)</text>
+            <rect class="d-accent" x="40" y="175" width="820" height="45"/>
+            <text class="d-text" x="60" y="203">new ice layer, gap g</text>
+            <line x1="40" y1="175" x2="860" y2="175" stroke="var(--accent)" stroke-width="2.5"/>
+            <text class="d-muted" x="700" y="168">new wall</text>
+            <line x1="40" y1="85" x2="860" y2="85" class="d-line" stroke-dasharray="6 5"/>
+            <text class="d-muted" x="700" y="80">d = 2g</text>
+            <line x1="40" y1="40" x2="860" y2="40" class="d-line" stroke-dasharray="2 5"/>
+            <text class="d-muted" x="700" y="35">d = 4g</text>
+            <circle cx="300" cy="140" r="7" fill="var(--warm)"/>
+            <text class="d-text" x="315" y="138">new node at distance d</text>
+            <circle cx="300" cy="185" r="7" fill="none" stroke="var(--warm)" stroke-width="2.5"/>
+            <path class="d-arrow" d="M300 147 L300 178" marker-end="url(#ah3)"/>
+            <text class="d-muted" x="315" y="194">sampled here: d from the OLD wall</text>
+            <circle cx="560" cy="140" r="7" fill="var(--muted)"/>
+            <text class="d-muted" x="575" y="138">plain interpolation would</text>
+            <text class="d-muted" x="575" y="156">sample at the same x, y</text>
+            <text class="d-text" x="140" y="62" text-anchor="middle">w = 0: plain</text>
+            <text class="d-text" x="140" y="110" text-anchor="middle">blend</text>
+            <text class="d-text" x="140" y="155" text-anchor="middle">w = 1</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 7.</b> Wall-relative mapping in <code>map_restart_to_mesh</code>. Below \(d = 2g\) the new node takes
+          the old state found at the same wall distance from the old wall; above \(4g\) it takes the plain interpolant. After
+          mapping, velocity and \(k\) are set to zero on the new wall (no-slip). Nodes outside the old domain (receding ice) take
+          the nearest old node. In glz4_32 shot 7, 7,344 of 135,671 nodes were mapped wall-relatively, the largest wall gap was
+          0.66 mm and no node was outside the source (<code>shot_07/warm/report.json</code>).</figcaption>
+      </figure>
+      <p>The <code>SU2Backend</code> applies the warm start only if the speed, angle, temperature, density, viscosity,
+        turbulence and transition models, nondimensionalization and wall temperature all match the source run. If the warm-started
+        solve fails, it retries cold in a separate <code>cold_retry</code> folder, so a bad initial guess can never cost the step.
+        The comment in <code>_warm_restart</code> gives the reason the default is on: on RG-15, a cold start was still 6× off
+        in drag after 1,500 iterations while the mapped start matched lift from iteration 0.</p>
+      <div class="callout limits"><div class="callout-title">Which paths warm-start</div>
+        <p>Not every command does this. The original <code>icing run</code> controller still cold-starts every new geometry.
+          <code>run-nodal</code> warm-starts through <code>controller.SU2Backend._warm_restart</code> (with the cold retry
+          above). <code>run-campaign</code> seeds each shot after the first with <code>campaign.run_warm_start</code>, and its
+          sealed block gates decide acceptance. <code>docs/MODELS.md</code> (Aerodynamics) describes the three cases. The mesh side of this is on the
+          <a href="mesh.html">mesh page</a>.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="force">The wall-force diagnostic <span class="level advanced">Advanced</span></h2>
+      <p>SU2 reports CL and CD from its own integration. As an independent check of the extracted wall fields, the solver
+        integrates the same panel pressure and skin friction itself (<code>icing/aerodynamics.py</code>,
+        <code>wall_force_coefficients</code>):</p>
+      $$\mathbf F = \sum_i \Big[-(p_i-\bar p)\,\mathbf n_i + q_\infty \mathbf C_{f,i}\Big]\ell_i ,\qquad q_\infty=\tfrac12\rho U_\infty^2$$
+      <p>with outward normals \(\mathbf n_i\). Subtracting the mean pressure \(\bar p\) does not change the force on a closed
+        polygon but limits round-off. Lift and drag are the components normal and parallel to the freestream, divided by
+        \(q_\infty c\); the moment about the quarter chord is divided by \(q_\infty c^2\). <code>SU2Backend</code> stores the result and its
+        difference from SU2's totals in <code>wall_force_check.json</code>. Applied to the two RG-15 solutions above (computed for
+        this page with the same function):</p>
+      <div class="table-wrap"><table>
+        <tr><th>Solution</th><th>CL (SU2)</th><th>CL (panel quadrature)</th><th>CD (SU2)</th><th>CD (panel)</th><th>pressure / friction CD</th></tr>
+        <tr><td>3.1 shot 1, clean</td><td>0.693200</td><td>0.693204</td><td>0.020862</td><td>0.020860</td><td>0.00719 / 0.01367</td></tr>
+        <tr><td>3.1 shot 7, iced</td><td>0.675008</td><td>0.675005</td><td>0.024305</td><td>0.024299</td><td>0.01229 / 0.01201</td></tr>
+      </table></div>
+      <p>The agreement to a few 10⁻⁶ shows that the coordinate matching, panel averaging and scaling preserve the loads. The
+        split is also informative: icing raised the pressure drag by 71 % while friction drag fell slightly. The diagnostic is
+        explicitly not a gate: it omits normal viscous stress and uses panel rather than dual-area quadrature.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="rough">Rough ice walls <span class="level advanced">Advanced</span></h2>
+      <p>Real ice is rough, and roughness raises both friction and heat transfer. SU2's SST model accepts an equivalent
+        sand-grain height \(k_s\) per wall marker (<code>WALL_ROUGHNESS</code>, <code>KIND_ROUGHSST_MODEL</code>). The RG-15 runs
+        use the simplest option: uniform \(k_s = 0.5\) mm with the <code>WILCOX1998</code> boundary condition. Since 2026-11-06
+        three opt-in refinements exist (<code>docs/ROUGHNESS_COUPLING.md</code>, <code>icing/roughness.py</code>):</p>
+      <ol>
+        <li><strong>Panel roughness and an evolving law.</strong> <code>roughness_by_panel</code> gives each panel its own
+          \(k_s\); <code>roughness_mesh()</code> splits the wall marker into <code>airfoil_rough_0000</code>, ... without moving any
+          node. A <code>roughness_law</code> derives \(k_s\) before every solve from the local ice thickness \(h\):
+          \(k_s=\min(0.717h,\ h,\ k_{s,\text{sat}})\), with 0.717 = 0.5·4.43/3.09 from McClain et al. and Flack &amp; Schultz, and a
+          saturation height from Shin &amp; Bond. Values are rounded onto a fixed ladder (4 steps per octave) so markers stay
+          stable between refreshes.</li>
+        <li><strong>Rough-wall heat-transfer correction.</strong> SU2 keeps a constant turbulent Prandtl number and has no
+          roughness term in the energy equation, so it under-represents the near-wall thermal resistance and over-predicts heat
+          transfer. <code>icing/rough_wall_layer.py</code> re-solves SU2's own SST inner layer in wall units to find the RANS
+          thermal offset \(\Delta_T\); <code>correct_heat_transfer()</code> adds the missing resistance in series:
+          $$\frac1{h_\text{corr}} = \frac1{h_\text{SU2}} + w(k_s^+)\,\gamma\,\frac{1/St_k - \Delta_{T,\text{RANS}}(k_s^+)}{\rho\,c_p\,u_\tau}$$
+          where \(1/St_k\) is an experimental correlation (Kays &amp; Crawford, or Owen &amp; Thomson as in LEWICE), \(w\) ramps from 0
+          at \(k_s^+=5\) to 1 at 70, and \(\gamma\) is the LM wall intermittency (laminar panels are not corrected).</li>
+        <li><strong>Roughness-induced transition.</strong> SU2 has no distributed-roughness trip, so the LEWICE criterion
+          (roughness Reynolds number vs a critical value) is applied outside SU2 on the LM solution. If the trip lies upstream of
+          LM's own transition, a fully turbulent companion solve is run and HTC and shear are blended
+          (<code>compose_rough_wall_loads</code>).</li>
+      </ol>
+      <figure>
+        <div class="frame"><img src="figures/airflow_roughness_offsets.png" alt="RANS thermal offset vs experimental inverse roughness Stanton number, and the regime ramp"></div>
+        <figcaption><b>Figure 8.</b> Left: the log-layer thermal offset \(\Delta_T\) of SU2's rough-wall SST treatment (computed with
+          <code>rough_wall_layer.model_offsets</code>) stays near zero, while experiment-based correlations give 1.5 to 12. The gap
+          is the thermal resistance RANS misses. Right: the correction weight \(w(k_s^+)\). The roughness document reports that
+          against the Coleman, Moffat &amp; Kays packed-sphere plate, constant-\(Pr_t\) RANS over-predicts the Stanton number by
+          16–22 % and the corrected value is within −2 % to +5 %, with the caveat that the Kays–Crawford constant was probably
+          fitted to the same surface.</figcaption>
+      </figure>
+      <div class="callout limits"><div class="callout-title">Roughness: status</div>
+        <p>Every extrapolated choice carries an <code># Unsure:</code> comment in the code (13 are listed in
+          <code>ROUGHNESS_COUPLING.md</code>), e.g. the correlation constants come from sand or spheres, not ice. The checks so far
+          are unit tests and short SU2 dry runs (3 and 30 iterations on a coarse cylinder): integration checks only. The proposed
+          four-arm RG-15 comparison is explicitly "NOT a prepared runnable test".</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="code">In the code <span class="level advanced">Advanced</span></h2>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <ul>
+          <li><code>icing/su2.py</code>: <code>FlowConditions</code>, <code>FlowNumerics</code>, <code>flow_config</code>,
+            <code>run_executable</code>, <code>convergence</code>, <code>prepare_restart</code>, <code>run_flow</code>,
+            <code>roughness_mesh</code> (and <code>deform</code>, used by the mesh step).</li>
+          <li><code>icing/fields.py</code>: <code>sample_wall_fields</code>, <code>wall_fields</code>,
+            <code>wall_mechanical_fields</code>, <code>volume_temperature_report</code>, <code>VTKVelocityField</code>.</li>
+          <li><code>icing/controller.py</code>: <code>SU2Backend</code> (<code>_warm_restart</code>, <code>_solve_once</code>,
+            <code>solve</code>) returns an <code>AeroSolution</code> (velocity, htc, shear, pressure, pressure_nodes).</li>
+          <li><code>icing/campaign.py</code>: <code>CFDPolicy</code>, <code>run_cfd</code>, <code>evaluate_block</code>,
+            <code>_block_metrics</code>, <code>run_warm_start</code>, <code>run_with_launch_retries</code>.</li>
+          <li><code>icing/su2_warm_start.py</code>: <code>map_restart_to_mesh</code>, <code>read_restart</code>,
+            <code>write_restart</code>.</li>
+          <li><code>icing/aerodynamics.py</code>: <code>wall_force_coefficients</code>.</li>
+          <li><code>icing/roughness.py</code>, <code>icing/rough_wall_layer.py</code>: roughness law, thermal correction, transition.</li>
+          <li><code>icing/flow_recovery.py</code>: <code>solve_with_recovery</code> reuses a fully validated completed flow (same mesh
+            digest, flow, backend settings and solver binary hash) when a droplet stage is resumed.</li>
+          <li><code>icing/wall_resolution.py</code>: wall <em>panel</em> spacing control on the growing ice (not \(y^+\)); see the
+            <a href="mesh.html">mesh page</a>.</li>
+        </ul></div>
+
+      <h3>The backend call, end to end</h3>
+<pre><code class="language-python">def _solve_once(self, mesh, surface, flow, directory, warm_start=None):
+    initial,warm=self._warm_restart(mesh,flow,warm_start)
+    try:
+        report=solve(directory,initial)          # run_flow(...): gates inside
+    except RuntimeError as error:
+        if initial is None:raise
+        warm=dict(warm,used=False,failed=str(error))
+        directory=directory/'cold_retry'
+        report=solve(directory,None)             # a bad guess never costs the step
+    fields=wall_fields(directory/'surface_flow.vtu',surface,flow)
+    if fields['Y_Plus_node_max']&gt;self.settings.get('max_yplus',2.):
+        raise RuntimeError(f'Wall resolution rejected: max y+=...')
+    force_audit=wall_force_coefficients(surface,fields['Pressure'],
+        fields['Skin_Friction_Coefficient'][:,:2],density=flow.density,speed=flow.speed,
+        chord=flow.chord,alpha_deg=flow.alpha_deg,moment_reference=(.25*flow.chord,0.))
+    atomic_json(directory/'wall_force_check.json',force_audit)
+    velocity=VTKVelocityField(directory/'flow.vtu',surface,
+                              velocity_scale=flow.output_scales['velocity'])
+    return dict(report=report,fields=fields,velocity=velocity,directory=directory)</code></pre>
+      <div class="code-src">icing/controller.py, SU2Backend._solve_once() (simplified)</div>
+      <p>Read it top to bottom: map a warm start if allowed; run SU2 with its convergence gates; on failure retry cold; read
+        the wall fields by coordinate matching; apply the \(y^+\) gate; save the force diagnostic; and wrap the volume file as a
+        velocity field for the droplets. <code>solve()</code> then passes the result through
+        <code>compose_rough_wall_loads</code> (which leaves HTC and shear unchanged unless a roughness option is on) and saves
+        <code>wall_fields.npz</code>.</p>
+
+      <h3>The block loop of a campaign (core)</h3>
+<pre><code class="language-python">while total &lt; policy.max_iterations:
+    length = min(policy.first_block if total == 0 else policy.block, policy.max_iterations - total)
+    end, second = total + length, total &gt;= first_order
+    block = folder / f'block_{end:07d}'
+    cfg.update(RESTART_SOL='NO' if seed is None else 'YES', ITER=length,
+               CONV_STARTITER=length + 1, MUSCL_FLOW='YES' if second else 'NO')
+    ...                                            # launch, screens, assessment.json, seal
+    metrics = _block_metrics(block, surface, flow, min(length, policy.window), cache)
+    seconds = seconds+[metrics] if metrics['second'] and metrics['safe'] else []
+    gate = evaluate_block(metrics, last_second, policy, lengths, history=seconds)
+    consecutive = consecutive + 1 if gate['qualified'] else 0
+    if policy.gates and consecutive &gt;= policy.consecutive:
+        break                                      # accepted
+    total, seed = end, block / 'restart_flow.dat'</code></pre>
+      <div class="code-src">icing/campaign.py, run_cfd() (simplified, reordered for reading)</div>
+      <p><code>CONV_STARTITER=length+1</code> switches off SU2's own convergence stop, so each block runs exactly its planned
+        iterations; the Python gates make the decision. The per-shot budget (<code>max_solver_hours</code>, default 48 h) and the
+        job deadline (<code>icing.hpc.solver_timeout</code>) bound the cost; a stopped job resumes at the next block.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="limits">Assumptions and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>Steady, two-dimensional, constant-density RANS. Below Mach 0.3 nominally; local compressibility is not checked
+            (<code>MODELS.md</code>).</li>
+          <li>One-way coupling: droplets and the water film do not affect the air; the wall temperature in the CFD is the probe
+            value, not the real surface temperature.</li>
+          <li>RANS turbulence models and the optional LM transition model carry their own modelling error; no grid-convergence
+            study of the icing inputs has been done for the RG-15 meshes.</li>
+          <li>A steady solution is required. A genuinely unsteady flow (for example massive separation behind a large horn) would
+            be rejected by the gates; an unsteady or time-averaged backend "remains required" (<code>MODELS.md</code>) and does not
+            exist yet.</li>
+          <li>The gates establish settled numbers, not correct numbers. No physical validation of the CFD inputs is claimed.</li>
+        </ul></div>
+      <p>Next: the velocity field is handed to the <a href="droplets.html">droplet step</a>.</p>
+    </article>
+  </main>
+</div>
+</body>
+</html>

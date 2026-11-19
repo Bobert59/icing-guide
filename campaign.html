@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running a campaign · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 11 · Running a campaign</div>
+      <h1>Running a campaign</h1>
+      <p class="lede">A real icing exposure lasts 20 minutes of tunnel time and takes one to two days on a
+        cluster. This page shows how the solver chops that exposure into shots, runs each shot as a chain of
+        sealed stages that can be stopped and resumed at any moment, and what a real returned campaign looks
+        like on disk and over time.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#idea">The idea: shots, stages and seals</a> <span class="level basic">Basic</span></li>
+          <li><a href="#modes">Run modes and the command line</a> <span class="level basic">Basic</span></li>
+          <li><a href="#files">The campaign file, field by field</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#loop">The shot loop</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#tree">Anatomy of a results folder</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#timeline">A real campaign, shot by shot</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#seals">Seals, resume and identity checks</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#walltime">Time budgets, walltime and launch faults</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#hpc">Running on the Nibi cluster</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="idea">The idea: shots, stages and seals <span class="level basic">Basic</span></h2>
+      <p>Ice changes the shape of the wing, and the shape changes the airflow, which changes where the next
+        ice grows. The solver cannot recompute the airflow continuously; one converged airflow solution costs
+        one to three hours on 16 processor cores. So it uses the <b>multishot</b> approach: the exposure is cut
+        into a short list of <b>shots</b>. In each shot the airflow and the droplet impact are computed once,
+        on the shape at the start of the shot, and are then held fixed while ice grows for the shot's duration
+        (for example 200 s). At the end of the shot the mesh is updated to the new iced shape and the next
+        shot starts.</p>
+      <p>Each shot is split into <b>stages</b>: airflow (CFD), droplet collection, ice growth and mesh
+        adaptation. Every stage writes its results into its own folder and, when it has finished, writes a
+        small receipt file called <code>done.json</code> that lists the SHA-256 fingerprint of every result
+        file. A folder with a receipt is <b>sealed</b>: it is complete and will never be recomputed or
+        changed. A folder without one is unfinished.</p>
+      <p>This gives the campaign a simple, strong property: you can kill it at any moment, run the very same
+        command again, and it continues from the last sealed stage. Nothing that was finished is redone,
+        nothing unfinished is silently overwritten, and a changed input is refused.</p>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>A campaign is a to-do list of shots. Each shot is four jobs done in order: compute the air, throw
+          the droplets, grow the ice, fix the mesh. Each finished job leaves a signed receipt. Restarting
+          means "skip everything that has a valid receipt and carry on". That is what lets a two-day
+          computation survive cluster time limits and node failures.</p></div>
+
+      <div class="callout why"><div class="callout-title">Why it is done this way</div>
+        <p>A cluster job has a hard time limit (the Nibi runs used 3-day jobs), and nodes do fail: on
+          2026-11-15 three running campaigns stopped at the same second with a node failure
+          (<code>VALIDATION_RUN_PLAN.txt</code>, item 5). A result that is half-written when the scheduler kills
+          the job must never be mistaken for a finished one. The module docstring of
+          <code>icing/campaign.py</code> states the rule: "Every stage is sealed with SHA-256 receipts;
+          rerunning the same command resumes. Incomplete stages are refused, never overwritten."</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="modes">Run modes and the command line <span class="level basic">Basic</span></h2>
+      <p>The program is started as <code>python -m icing &lt;command&gt;</code> (or the <code>icing</code>
+        script). The commands are defined in <code>icing/cli.py</code>, function <code>main()</code>. The
+        solver grew over several months, and each command belongs to a stage of that growth. All of them
+        need an explicit case file; none runs a default "demo".</p>
+
+      <div class="table-wrap"><table>
+        <tr><th>Command</th><th>Calls</th><th>What it is for</th></tr>
+        <tr><td><code>run</code></td><td><code>controller.run_case</code></td><td>The original transactional
+          coupling loop (<code>icing/controller.py</code>): a thin layered ice model on fixed material panels,
+          re-run CFD every step. Kept for the early George-2 rime cases (<code>examples/george2_rime.json</code>).
+          Its docstring: "Run only with converged CFD".</td></tr>
+        <tr><td><code>run-nodal</code></td><td><code>nodal_case.prepare_nodal_case</code> →
+          <code>nodal_run.run_nodal_exposure</code></td><td>Cold (rime) icing with a <b>conducting solid</b>:
+          the substrate and the ice are a finite-element mesh with heat conduction. Repeated qualified steps,
+          and a final CFD on the final shape. <code>--preflight</code> checks inputs without launching any
+          solver.</td></tr>
+        <tr><td><code>init-coupled</code></td><td><code>coupled_initial.initialize_coupled_geometry</code></td>
+          <td>Builds a clean starting "geometry bundle" for the phase-aware (glaze) path. No solvers.</td></tr>
+        <tr><td><code>run-coupled</code></td><td><code>coupled_case.prepare_coupled_case</code> →
+          <code>coupled_exposure.run_coupled_exposure</code></td><td>Phase-aware exposure (liquid film,
+          melting, refreezing) from an accepted bundle, refreshing the flow on every accepted geometry.
+          The building block that the glaze campaign later reused.</td></tr>
+        <tr><td><code>run-campaign</code></td><td><code>hpc.run_resumable(campaign.run_campaign, ...)</code></td>
+          <td><b>The production driver.</b> Multishot, resumable and cluster-ready. The campaign file's
+          <code>ice_model</code> chooses the ice stage: <code>"rime"</code> uses the conducting nodal model,
+          <code>"glaze"</code> hands the shot loop to <code>glaze_campaign.run_glaze_shots</code>.
+          <code>--pilot</code> swaps in the file's short pilot schedule.</td></tr>
+        <tr><td><code>mesh-check</code></td><td><code>Mesh.read</code>, <code>require_valid</code></td>
+          <td>Prints signed cell quality and wall topology of an SU2 mesh. Cheap; no solver.</td></tr>
+      </table></div>
+
+      <p>The <code>run-campaign</code> branch is three lines. The important part is the wrapper
+        <code>run_resumable</code>, explained in the <a href="#walltime">walltime</a> section: it turns a clean
+        "out of time" stop into the special exit status 75 that tells the cluster script to resubmit.</p>
+<pre><code class="language-python">elif args.command=='run-campaign':
+    from .campaign import run_campaign
+    from .hpc import run_resumable
+    result=run_resumable(run_campaign,args.case,args.output,pilot=args.pilot)
+</code></pre>
+      <div class="code-src">icing/cli.py, main()</div>
+
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p><code>icing/cli.py</code> → <code>main()</code>; <code>icing/campaign.py</code> →
+          <code>run_campaign()</code>, <code>load_campaign()</code>; <code>icing/glaze_campaign.py</code> →
+          <code>run_glaze_shots()</code>; <code>icing/hpc.py</code> → <code>run_resumable()</code>.
+          The RG-15 packages do not call the CLI; their <code>run.py</code> imports <code>run_campaign</code>
+          directly and adds a hash check of the frozen inputs, a comparison step and a return bundle.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="files">The campaign file, field by field <span class="level intermediate">Intermediate</span></h2>
+      <p>A campaign needs two JSON files. The <b>nodal case</b> describes the physics of the experiment: the
+        mesh, the substrate, the air, the cloud and the SU2 settings. The <b>campaign file</b> describes how
+        to run it: the shot schedule, the CFD acceptance policy, the ice-stage controls and the mesh
+        adaptation. Below are the real files of the RG-15 case 3.2 run on Nibi,
+        <code>runs/nibi/glz81_32/package/</code> (trimmed where marked).</p>
+
+      <h3>nodal_case_32.json: the experiment</h3>
+<pre><code class="language-json">{
+  "mesh": "mesh.su2",                  // clean fluid mesh (tunnel channel, generated)
+  "solid": "solid_32.npz",             // PLA substrate mesh inside the airfoil
+  "flow": { "speed": 25.0, "alpha_deg": 0.0, "temperature": 269.15,
+            "density": 1.3112, "viscosity": 1.696e-05, "chord": 0.3,
+            "turbulence": "SST", "wall_temperature": 273.15,
+            "roughness_height": 0.0005, "roughness_model": "WILCOX1998" },
+  "thermal": { "evaporation": true, "relative_humidity": 1.0, "humidity_reference": "water" },
+  "exposure_time": 1200.0, "time_step": 4.0, "thermal_step": 0.005,
+  "ice_density": 917.0, "ice_conductivity": 2.2, "gravity": [0.0, -9.81],
+  "droplets": { "lwc": 0.00052,
+                "bins": [ {"diameter": 7.3e-06, "mass_fraction": 0.05}, ... 7 bins ...,
+                          {"diameter": 8.13e-05, "mass_fraction": 0.05} ],
+                "inlet_center": [-0.6, 0.0], "inlet_width": 0.3, ... },
+  "su2": { "mpi_ranks": 6, "cfd_executable": "SU2_CFD", "def_executable": "SU2_DEF",
+           "mpi_executable": "srun", ... }
+}</code></pre>
+      <div class="code-src">runs/nibi/glz81_32/package/nodal_case_32.json (comments added, trimmed)</div>
+      <ul>
+        <li><b>flow</b>: 25 m/s air at 269.15 K (-4 °C), the IPW-2 case 3.2 conditions
+          (<code>data/rg15_ipw2/conditions.json</code>). <code>alpha_deg</code> is 0 because the 4° incidence
+          is built into the mesh: the airfoil was rotated into the tunnel frame
+          (<code>tools/prepare_rg15_glaze_package.py</code>). The wall is an isothermal 273.15 K probe used to
+          extract the heat-transfer coefficient (see <a href="airflow.html">Step 3</a>).</li>
+        <li><b>droplets</b>: liquid water content 0.52 g/m³ in seven diameter bins from 7.3 to 81.3 µm.</li>
+        <li><b>su2</b>: executable names. On the cluster these are replaced through recorded environment
+          overrides (<code>icing.hpc.site_settings</code>), which is why <code>mpi_ranks: 6</code> here became
+          16 on Nibi.</li>
+      </ul>
+
+      <h3>campaign_32.json: how to run it</h3>
+<pre><code class="language-json">{
+  "nodal_case": "nodal_case_32.json",
+  "schedule": [30, 200, 200, 200, 200, 200, 170],      // seven shots, 1,200 s in total
+  "seed_restart": null,                                 // cold CFD start
+  "cfd_template": "template_32.cfg",
+  "initial_mesh": "source",                             // use mesh.su2 as given
+  "cfd": { "first_block": 2000, "block": 10000, "max_iterations": 1000000,
+           "max_solver_hours": 48, "first_order_after_remesh": 2000,
+           "gates": true, "gate_mode": "windowed", "window_blocks": 2, "consecutive": 2,
+           "mean_cl_rel": 0.001, "mean_cd_rel": 0.005, "htc_rel_l1": 0.005, "htc_peak": 0.02,
+           "cp_rel_l1": 0.1, "cp_peak": 0.1, "residual_rise": 0.2, "residual_rise_blocks": 5, ... },
+  "ice": { "increment": 4.0, "thermal_step": 0.005, "density": 917.0, "conductivity": 2.2,
+           "mass_gate": 1e-08, "energy_gate": 0.01, "local_recovery": true },
+  "collection_seeds": 25664,                            // seeds per droplet bin
+  "mesh_adaptation": { "wall": {"design_factor": 1.0, "max_turn_deg": 5, "grading": 1.2, ...},
+                       "remesh": {"target_yplus": 1.0, "growth": 1.2, ...}, "prefer": "AUTO" },
+  "deformation_methods": ["RBF", "ELASTIC"], "rbf_radius": 0.6,
+  "pilot": { "schedule": [1.0, 1.0], "cfd": {"first_block": 10, "max_iterations": 3010, "gates": false, ...},
+             "ice": {"increment": 0.5}, "collection_seeds": 64, "prefer_by_shot": ["AUTO", "REMESH"] },
+  "ice_model": "glaze",
+  "glaze": { "liquid_conductivity": 0.56, "outlet_panels": "sharp_corners",
+             "solid_remesh": {"min_new_nodes": 500}, "wall_refinement": true,
+             "film_air_coupling": {}, "front_merging": {}, ... }
+}</code></pre>
+      <div class="code-src">runs/nibi/glz81_32/package/campaign_32.json (comments added, trimmed)</div>
+
+      <div class="table-wrap"><table>
+        <tr><th>Field</th><th>Meaning</th><th>Read by</th></tr>
+        <tr><td><code>schedule</code></td><td>Shot durations in seconds. A short first shot (30 s) lets the
+          clean-shape flow act only briefly before the first ice shape is fed back.</td>
+          <td><code>load_campaign</code></td></tr>
+        <tr><td><code>cfd</code></td><td>The <code>CFDPolicy</code>: block lengths and the acceptance gates.</td>
+          <td><code>CFDPolicy(**case['cfd'])</code></td></tr>
+        <tr><td><code>ice</code></td><td>The <code>IcePolicy</code>: growth increment (4 s of exposure per
+          geometry update), thermal step, ice properties and the cumulative conservation gates.</td>
+          <td><code>IcePolicy(**case['ice'])</code></td></tr>
+        <tr><td><code>collection_seeds</code></td><td>Droplet seeds per bin (25,664 × 7 bins = 179,648
+          trajectories per shot, the number printed in the Nibi log).</td><td><code>run_collection</code></td></tr>
+        <tr><td><code>mesh_adaptation</code></td><td>Wall refinement rules and the y⁺-targeted remesher
+          (<a href="mesh.html">Step 9</a>). <code>prefer: AUTO</code> tries to deform first and remeshes if
+          that fails.</td><td><code>MeshAdaptation</code></td></tr>
+        <tr><td><code>pilot</code></td><td>Overrides for a cheap integration check: two 1 s shots, tiny CFD
+          blocks, gates off, 64 seeds per bin, and a forced REMESH in shot 2 so that every code path runs.</td>
+          <td><code>run_campaign(pilot=True)</code></td></tr>
+        <tr><td><code>ice_model</code>, <code>glaze</code></td><td>Selects the glaze ice stage and its
+          controls (validated by <code>glaze_controls</code> against <code>GLAZE_DEFAULTS</code>).</td>
+          <td><code>glaze_campaign</code></td></tr>
+        <tr><td><code>gate_revision</code></td><td>Optional. An authorised, logged change of CFD acceptance
+          limits for a campaign that is already running (see <a href="#seals">identity checks</a>).</td>
+          <td><code>check_identity</code></td></tr>
+      </table></div>
+      <p><code>load_campaign</code> refuses any unknown top-level field, a non-positive shot duration, an
+        unknown <code>ice_model</code>, or glaze controls without <code>"ice_model": "glaze"</code>. A typo
+        therefore stops the run before any solver starts, rather than being silently ignored.</p>
+
+      <h3>The two policies</h3>
+<pre><code class="language-python">@dataclass(frozen=True)
+class CFDPolicy:
+    first_block: int = 2000
+    block: int = 10000
+    max_iterations: int = 1_000_000
+    max_solver_hours: float = 48.
+    consecutive: int = 2
+    first_order_after_remesh: int = 2000
+    gates: bool = True            # False only for integration pilots: accept at the cap
+    gate_mode: str = 'instantaneous'   # or 'load_based', 'windowed'
+    window_blocks: int = 2        # windowed only
+    mean_cl_rel: float = .001
+    mean_cd_rel: float = .005
+    residual_rise: float = .2     # log10 units
+    ...
+
+@dataclass(frozen=True)
+class IcePolicy:
+    increment: float = 4.          # s of exposure per growth update (held loads)
+    thermal_step: float = .005
+    density: float = 917.
+    conductivity: float = 2.2
+    mass_gate: float = 1e-8        # kg/m cumulative residual
+    energy_gate: float = .01       # J/m cumulative residual
+    local_recovery: bool = False</code></pre>
+      <div class="code-src">icing/campaign.py, CFDPolicy and IcePolicy (simplified)</div>
+      <p><b>CFDPolicy</b> says how long each SU2 block is and when the flow counts as finished. In the
+        <code>windowed</code> mode used on Nibi, residuals only guard against divergence (no equation's
+        block-median log residual may rise by more than 0.2 over 5 blocks). Acceptance compares averages:
+        the mean lift and drag of the last two safe second-order blocks against the two before, and the wall
+        profiles of heat-transfer coefficient (HTC), shear and pressure coefficient. The flow is accepted
+        after two consecutive qualified blocks. <b>IcePolicy</b> holds the ice-stage clock: loads are held
+        for 4 s of exposure per geometry update, the thermal solver steps at 5 ms, and the cumulative mass
+        and energy residuals must stay below 10⁻⁸ kg/m and 0.01 J/m or the run stops.</p>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>The CFD gates are the project's <em>preliminary</em> acceptance policy, not proof of a converged
+            physical solution. Every <code>assessment.json</code> carries <code>"physical_validation": false</code>.</li>
+          <li>Within a shot the airflow and droplet loads are frozen (quasi-steady assumption). The shot length
+            is a numerical choice; shot-length sensitivity is not established by these runs.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="loop">The shot loop <span class="level intermediate">Intermediate</span></h2>
+      <p>Figure 1 shows what <code>run_campaign</code> does, with the folder each step writes. Gold seals mark
+        the <code>done.json</code> receipts.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 820 660" role="img" aria-label="Flowchart of the multishot campaign: preparation, initial stages, then a loop per shot of warm start, CFD blocks, collection, ice growth and adaptation, each sealed">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+            <g id="seal"><circle r="9" fill="#e9a23b"/><path d="M-4,0 l3,3 l5,-6" stroke="#fff" stroke-width="2" fill="none"/></g>
+          </defs>
+          <!-- preparation -->
+          <rect x="20" y="20" width="230" height="64" rx="8" class="d-box"/>
+          <text x="135" y="45" text-anchor="middle" class="d-text">campaign_32.json + nodal case</text>
+          <text x="135" y="66" text-anchor="middle" class="d-muted">load_campaign: validate fields</text>
+          <rect x="295" y="20" width="230" height="64" rx="8" class="d-box"/>
+          <text x="410" y="45" text-anchor="middle" class="d-text">check_identity</text>
+          <text x="410" y="66" text-anchor="middle" class="d-muted">campaign.json: inputs unchanged?</text>
+          <rect x="570" y="20" width="230" height="64" rx="8" class="d-ok"/>
+          <text x="685" y="45" text-anchor="middle" class="d-text">initial/  →  initial_glaze/</text>
+          <text x="685" y="66" text-anchor="middle" class="d-muted">clean mesh, solid, glaze history</text>
+          <use href="#seal" x="790" y="22"/>
+          <path d="M250,52 H290" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M525,52 H565" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M685,84 V118" class="d-arrow" marker-end="url(#ah)"/>
+          <!-- loop frame -->
+          <rect x="20" y="122" width="780" height="440" rx="12" fill="none" stroke="var(--accent)" stroke-dasharray="6 5" stroke-width="1.5"/>
+          <text x="40" y="146" class="d-text" font-weight="700">for each shot k = 1 … 7   (folder shot_0k/)</text>
+          <!-- stages -->
+          <rect x="60" y="164" width="330" height="62" rx="8" class="d-accent"/>
+          <text x="225" y="188" text-anchor="middle" class="d-text">1  warm/  (k &gt; 1)</text>
+          <text x="225" y="210" text-anchor="middle" class="d-muted">map last restart onto new mesh → seed.dat</text>
+          <use href="#seal" x="380" y="166"/>
+          <rect x="60" y="246" width="330" height="80" rx="8" class="d-accent"/>
+          <text x="225" y="270" text-anchor="middle" class="d-text">2  flow/  SU2 in sealed blocks</text>
+          <text x="225" y="291" text-anchor="middle" class="d-muted">block_0002000, block_0012000, …</text>
+          <text x="225" y="311" text-anchor="middle" class="d-muted">each sealed; gates decide acceptance</text>
+          <use href="#seal" x="380" y="248"/>
+          <rect x="60" y="346" width="330" height="62" rx="8" class="d-accent"/>
+          <text x="225" y="370" text-anchor="middle" class="d-text">3  collect/  droplet trajectories</text>
+          <text x="225" y="392" text-anchor="middle" class="d-muted">forcing.npz: mass and impact energy per panel</text>
+          <use href="#seal" x="380" y="348"/>
+          <rect x="60" y="428" width="330" height="62" rx="8" class="d-warm"/>
+          <text x="225" y="452" text-anchor="middle" class="d-text">4  ice/  grow in 4 s increments</text>
+          <text x="225" y="474" text-anchor="middle" class="d-muted">loads held; slot_0 / slot_1 checkpoints</text>
+          <use href="#seal" x="380" y="430"/>
+          <rect x="60" y="510" width="330" height="40" rx="8" class="d-accent"/>
+          <text x="225" y="535" text-anchor="middle" class="d-text">5  adapt/  refine wall, deform or remesh</text>
+          <use href="#seal" x="380" y="512"/>
+          <path d="M225,226 V242" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M225,326 V342" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M225,408 V424" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M225,490 V506" class="d-arrow" marker-end="url(#ah)"/>
+          <!-- shot seal and loop back -->
+          <rect x="470" y="490" width="300" height="60" rx="8" class="d-ok"/>
+          <text x="620" y="514" text-anchor="middle" class="d-text">shot_0k/done.json</text>
+          <text x="620" y="536" text-anchor="middle" class="d-muted">hashes of the four stage receipts</text>
+          <use href="#seal" x="760" y="492"/>
+          <path d="M390,530 H466" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M620,490 V200 H396" class="d-arrow" marker-end="url(#ah)"/>
+          <text x="630" y="300" class="d-muted">next shot starts on</text>
+          <text x="630" y="318" class="d-muted">adapt/mesh.su2 and</text>
+          <text x="630" y="336" class="d-muted">adapt/ (ice state);</text>
+          <text x="630" y="354" class="d-muted">first-order startup</text>
+          <text x="630" y="372" class="d-muted">only after a REMESH</text>
+          <!-- end -->
+          <path d="M620,562 V590" class="d-arrow" marker-end="url(#ah)"/>
+          <rect x="470" y="594" width="300" height="50" rx="8" class="d-box"/>
+          <text x="620" y="624" text-anchor="middle" class="d-text">summary.json, final_surface.csv</text>
+          <text x="40" y="600" class="d-muted">A stopped run restarts at the first stage without a valid seal.</text>
+          <text x="40" y="620" class="d-muted">An unsealed stage folder is refused, never overwritten.</text>
+        </svg></div>
+        <figcaption><b>Figure 1.</b> The shot loop of <code>campaign.run_campaign</code> (rime) and
+          <code>glaze_campaign.run_glaze_shots</code> (glaze), which are line-for-line parallel. Stage 4 is the
+          only one that differs between rime and glaze. Gold circles are seals (<code>done.json</code>).
+          The arrow on the right is the feedback that makes this "multishot": the next shot's CFD runs on the
+          mesh produced by this shot's adaptation.</figcaption>
+      </figure>
+
+      <p>Here is the glaze loop with only the orchestration kept. Read it as the figure, top to bottom.</p>
+<pre><code class="language-python">def run_glaze_shots(c, out, site, timings, prefer_by_shot, mesh_path, seed, first_order):
+    initial = out / 'initial_glaze'
+    run_glaze_initial(out / 'initial' / 'solid.json', mesh_path, initial, c)
+    state_dir, start = initial, 0.
+    for index, duration in enumerate(c.schedule, 1):
+        folder = out / f'shot_{index:02d}'
+        end = start + duration
+        mesh = Mesh.read(mesh_path)
+        if not _done(folder):
+            if index > 1:                                           # 1 warm start
+                prev = out / f'shot_{index - 1:02d}'
+                run_warm_start(prev / 'flow' / 'restart_flow.dat', Mesh.read(prev / 'flow' / 'mesh.su2'),
+                               mesh_path, folder / 'warm')
+                seed = folder / 'warm' / 'seed.dat'
+            run_cfd(mesh, seed, folder / 'flow', c, site, timings, first_order)          # 2
+            run_collection(mesh, folder / 'flow', folder / 'collect', c, site, timings)  # 3
+            run_glaze_ice(state_dir / 'history.json', state_dir / 'surface.json', mesh,  # 4
+                          folder / 'flow', folder / 'collect', folder / 'ice', c, start, end, timings)
+            if not _done(folder / 'adapt'):                          # 5
+                run_with_launch_retries(folder / 'adapt', lambda: run_glaze_adaptation(...), ...)
+            _seal(folder, ['flow/done.json', 'collect/done.json', 'ice/done.json', 'adapt/done.json'],
+                  index=index, start_s=start, end_s=end, ice_model='glaze')
+        decision = _read(folder / 'adapt' / 'done.json')['decision']
+        mesh_path, state_dir = folder / 'adapt' / 'mesh.su2', folder / 'adapt'
+        first_order = c.cfd.first_order_after_remesh if decision == 'REMESH' else 0
+        start = end</code></pre>
+      <div class="code-src">icing/glaze_campaign.py, run_glaze_shots() (simplified)</div>
+      <p>Each <code>run_*</code> function starts with <code>if _done(dest): return</code>. So on a restart the
+        loop simply walks past every sealed stage in milliseconds and resumes at the first unsealed one.
+        Notice the last line but one: after a <b>REMESH</b> the new mesh has no matching flow history, so the
+        next shot's CFD starts with 2,000 first-order iterations; after a <b>DEFORM</b> the old solution maps
+        node-for-node and second order starts immediately.</p>
+
+      <h3>What each stage does</h3>
+      <ol class="steps">
+        <li><b>Initial mesh.</b> <code>initial/</code> holds the shot-1 fluid mesh and the clean substrate
+          state. With <code>initial_mesh: "source"</code> the given mesh is copied; with
+          <code>"generate"</code> (the rime campaigns) a two-iteration SU2 "shear probe" supplies the wall
+          shear for a y⁺ target and the campaign's own remesher builds the mesh
+          (<code>generate_initial_mesh</code>). For glaze, <code>run_glaze_initial</code> converts the clean
+          state into a phase-aware thermal history in <code>initial_glaze/</code>.</li>
+        <li><b>Warm start</b> (<code>run_warm_start</code> → <code>su2_warm_start.map_restart_to_mesh</code>).
+          The previous shot's converged SU2 restart is interpolated onto the new mesh. Near the wall each
+          node samples the old field at the same distance from the old wall, because the wall itself has
+          moved outward by up to millimetres. "A warm start only changes the initial guess; the same
+          acceptance gates decide the solution." The shot-6 report of case 3.2 lists 150,023 nodes, 14,062
+          mapped wall-relative and a largest wall gap of 2.1 mm.</li>
+        <li><b>CFD</b> (<code>run_cfd</code>). SU2 runs in blocks: first 2,000 iterations, then 10,000 at a
+          time. Each block is a separate folder <code>block_NNNNNNN</code> named by its final iteration count,
+          restarted from the previous block's <code>restart_flow.dat</code> and sealed with an
+          <em>anchor</em> (the hash of its seed, start, end and order) so the restart chain cannot be mixed
+          up. After each block, safety screens (volume temperature, positive HTC) and the gates run. When
+          the gates accept, the last block's files are copied up into <code>flow/</code> and sealed.</li>
+        <li><b>Collection</b> (<code>run_collection</code>). Lagrangian droplets on the accepted flow field,
+          in batches that checkpoint themselves (<code>collect/batches/</code>). The inlet-capture guard must
+          show no impacts at the edge of the seeding band, or the stage fails. Output:
+          <code>forcing.npz</code> with mass and kinetic-energy rates per wall panel.</li>
+        <li><b>Ice</b> (<code>run_ice</code> for rime, <code>run_glaze_ice</code> for glaze). The shot is
+          integrated in increments of <code>ice.increment</code> = 4 s with the loads held. After each
+          increment the state is written to one of two alternating slots and a pointer file
+          <code>progress.json</code> names the latest one (explained below). A reducible failure halves the
+          increment; four successes in a row double it back (<code>REGROW_AFTER = 4</code>).</li>
+        <li><b>Adaptation</b> (<code>run_adaptation</code> / <code>run_glaze_adaptation</code>). Stretched
+          iced wall panels are split, and the fluid mesh is either deformed with SU2_DEF or rebuilt with
+          explicit wall layers and Gmsh (<a href="mesh.html">Step 9</a>). Every remesh starts from the
+          original outer boundary, "so mesh size cannot compound shot to shot". The decision is written into
+          the seal: <code>"decision": "REMESH"</code>.</li>
+      </ol>
+
+      <!-- ============================================================ -->
+      <h2 id="tree">Anatomy of a results folder <span class="level intermediate">Intermediate</span></h2>
+      <p>Figure 2 is the folder that the case 3.2 run left on Nibi, as returned in
+        <code>runs/nibi/glz81_32/failure_27435273_return.tar.gz</code> (1.1 GB; most of it is droplet batch
+        files and CFD volume fields). The run folder around it is shown too.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 820 900" role="img" aria-label="Folder tree of the glz81_32 run and its results_32 campaign folder with numbered call-outs">
+          <g font-family="JetBrains Mono, monospace" font-size="13.5" class="d-text" xml:space="preserve" style="font-family: var(--mono); white-space: pre">
+            <text x="20" y="28" class="d-text" style="font-family: var(--mono); font-weight:700">glz81_32/&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;(run&#160;folder&#160;on&#160;$SCRATCH)</text>
+            <text x="20" y="50" class="d-text" style="font-family: var(--mono)">├─&#160;job.env&#160;&#160;provenance.json&#160;&#160;executables.json</text>
+            <text x="20" y="72" class="d-text" style="font-family: var(--mono)">├─&#160;jobs.log&#160;&#160;submissions.log&#160;&#160;logs/*.out&#160;&#160;FAILED</text>
+            <text x="20" y="94" class="d-text" style="font-family: var(--mono)">├─&#160;code/&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;(read-only&#160;code&#160;snapshot)</text>
+            <text x="20" y="116" class="d-text" style="font-family: var(--mono)">└─&#160;package/&#160;&#160;&#160;run.py&#160;&#160;manifest.json&#160;&#160;EXPERIMENT_PLAN.txt</text>
+            <text x="20" y="138" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;│&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;campaign_32.json&#160;&#160;nodal_case_32.json&#160;&#160;mesh.su2&#160;...</text>
+            <text x="20" y="160" class="d-text" style="font-family: var(--mono); font-weight:700">&#160;&#160;&#160;└─&#160;results_32/</text>
+            <text x="20" y="182" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;├─&#160;campaign.json&#160;&#160;timings.json&#160;&#160;site_&lt;time&gt;.json</text>
+            <text x="20" y="204" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;├─&#160;initial/&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;mesh.su2&#160;&#160;solid.json&#160;&#160;done.json</text>
+            <text x="20" y="226" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;├─&#160;initial_glaze/&#160;&#160;history.json&#160;&#160;surface.json&#160;&#160;inventory.json&#160;&#160;done.json</text>
+            <text x="20" y="248" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;├─&#160;shot_01/&#160;&#160;done.json</text>
+            <text x="20" y="270" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;├─&#160;flow/</text>
+            <text x="20" y="292" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;├─&#160;block_0002000/&#160;&#160;flow.cfg&#160;mesh.su2&#160;restart_flow.dat&#160;history.csv</text>
+            <text x="20" y="314" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;│&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;flow.vtu&#160;surface_flow.vtu&#160;solver.log&#160;launch.json</text>
+            <text x="20" y="336" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;│&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;execution.json&#160;assessment.json&#160;gate.json&#160;done.json</text>
+            <text x="20" y="358" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;├─&#160;block_0012000/&#160;…&#160;block_0062000/&#160;&#160;&#160;(+&#160;wall_profile.npz)</text>
+            <text x="20" y="380" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;└─&#160;restart_flow.dat&#160;surface_flow.vtu&#160;history.csv&#160;…&#160;done.json</text>
+            <text x="20" y="402" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;├─&#160;collect/&#160;&#160;&#160;batches/&lt;hash&gt;/batch_*.json&#160;&#160;audit.json&#160;&#160;forcing.npz&#160;&#160;done.json</text>
+            <text x="20" y="424" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;├─&#160;ice/&#160;&#160;&#160;&#160;&#160;&#160;&#160;progress.json&#160;&#160;slot_0/&#160;&#160;slot_1/&#160;&#160;solid_remesh_00007/&#160;…</text>
+            <text x="20" y="446" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;│&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;history.json&#160;&#160;surface.json&#160;&#160;surface.csv&#160;&#160;summary.json&#160;&#160;done.json</text>
+            <text x="20" y="468" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;└─&#160;adapt/&#160;&#160;&#160;&#160;&#160;fluid/deform_0_RBF/&#160;(or&#160;fluid/remesh/)&#160;&#160;wall_refinement/</text>
+            <text x="20" y="490" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;mesh.su2&#160;&#160;history.json&#160;&#160;surface.json&#160;&#160;quality.json&#160;&#160;done.json</text>
+            <text x="20" y="512" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;├─&#160;shot_02/&#160;…&#160;shot_05/&#160;&#160;&#160;(same&#160;layout,&#160;plus&#160;warm/&#160;seed.dat&#160;report.json&#160;done.json)</text>
+            <text x="20" y="534" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;│&#160;&#160;&#160;&#160;&#160;shot_04/flow/block_0052000.interrupted_20261115T144248Z/</text>
+            <text x="20" y="556" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;└─&#160;shot_06/&#160;&#160;&#160;warm/&#160;flow/&#160;collect/&#160;sealed;&#160;&#160;ice/&#160;NOT&#160;sealed:</text>
+            <text x="20" y="578" class="d-text" style="font-family: var(--mono)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;progress.json&#160;&#160;slot_0/&#160;&#160;slot_1/&#160;&#160;failure_interval_00025.pkl</text>
+          </g>
+          <!-- callouts -->
+          <g font-size="12" font-weight="700">
+            <circle cx="790" cy="50" r="11" fill="#e9a23b"/><text x="790" y="54" text-anchor="middle" fill="#fff">1</text>
+            <circle cx="790" cy="116" r="11" fill="#e9a23b"/><text x="790" y="120" text-anchor="middle" fill="#fff">2</text>
+            <circle cx="790" cy="182" r="11" fill="#e9a23b"/><text x="790" y="186" text-anchor="middle" fill="#fff">3</text>
+            <circle cx="790" cy="314" r="11" fill="#e9a23b"/><text x="790" y="318" text-anchor="middle" fill="#fff">4</text>
+            <circle cx="790" cy="424" r="11" fill="#e9a23b"/><text x="790" y="428" text-anchor="middle" fill="#fff">5</text>
+            <circle cx="790" cy="534" r="11" fill="#e9a23b"/><text x="790" y="538" text-anchor="middle" fill="#fff">6</text>
+            <circle cx="790" cy="578" r="11" fill="#e9a23b"/><text x="790" y="582" text-anchor="middle" fill="#fff">7</text>
+          </g>
+          <g class="d-muted" font-size="12.5">
+            <text x="20" y="626">1  Cluster bookkeeping: executables are fingerprinted at the first job and must not change;</text>
+            <text x="20" y="646">   jobs.log counts chained jobs; FAILED marks a model failure (no resubmission).</text>
+            <text x="20" y="670">2  The frozen package: manifest.json holds the SHA-256 of every input; run.py refuses changed inputs.</text>
+            <text x="20" y="694">3  Campaign-level records: identity (campaign.json), longest stage times (timings.json), site settings.</text>
+            <text x="20" y="718">4  One sealed SU2 block: everything needed to restart, re-check or re-plot it.</text>
+            <text x="20" y="742">5  The ice stage's two alternating checkpoints and solid-mesh remesh records.</text>
+            <text x="20" y="766">6  An unsealed block left by the node failure, renamed (never deleted) when the run was resumed.</text>
+            <text x="20" y="790">7  Where the run stopped: shot 6 ice at 926 s. The failing interval's inputs were saved so it can be</text>
+            <text x="20" y="810">   replayed alone (tools/replay_glaze_interval.py --capture).</text>
+            <text x="20" y="840">summary.json and final_surface.csv appear in results_32/ only when every shot is sealed.</text>
+          </g>
+        </svg></div>
+        <figcaption><b>Figure 2.</b> The returned case 3.2 run (<code>runs/nibi/glz81_32</code>), listed
+          from the archive. File names are real; the ellipses stand for repeated blocks and remesh folders.
+          The numbered call-outs are explained under the tree.</figcaption>
+      </figure>
+
+      <div class="table-wrap"><table>
+        <tr><th>File</th><th>What it holds</th><th>Written by</th></tr>
+        <tr><td><code>done.json</code></td><td>The seal: <code>{"files": {name: sha256}, ...extra}</code>.
+          Extra fields record e.g. <code>iterations</code>, <code>solver_seconds</code>,
+          <code>accepted_by</code> (flow) or <code>decision</code> (adapt).</td><td><code>_seal</code></td></tr>
+        <tr><td><code>assessment.json</code></td><td>Per CFD block: temperature screen, convergence, HTC
+          stability, max y⁺, <code>physical_validation: false</code>.</td><td><code>run_cfd</code></td></tr>
+        <tr><td><code>gate.json</code></td><td>The acceptance verdict, recomputed from the sealed files under
+          the active policy. Deliberately not part of the seal, so an authorised gate revision can re-judge
+          old blocks.</td><td><code>evaluate_block</code></td></tr>
+        <tr><td><code>launch.json</code>, <code>execution.json</code>, <code>solver.log</code></td>
+          <td>The exact command, timing and return code of each SU2 launch.</td><td><code>su2.run_executable</code></td></tr>
+        <tr><td><code>audit.json</code></td><td>Collection: inlet-capture audit, captured mass rate, seeds per
+          bin, workers, elapsed time, <code>collection_qualified: false</code>.</td><td><code>run_collection</code></td></tr>
+        <tr><td><code>ice/summary.json</code></td><td>Glaze: solid ice, column ice and liquid (kg/m), the
+          water ledger (incoming, vapour, runoff, stripped), halvings, solver paths, front merging and seal
+          counts, wall-clock cost.</td><td><code>run_glaze_ice</code></td></tr>
+        <tr><td><code>adapt/quality.json</code></td><td>Cell quality of the new mesh, the deform/remesh
+          attempts and reasons, wall vertices, fluid points and cells, wall-refinement report.</td>
+          <td><code>run_glaze_adaptation</code></td></tr>
+        <tr><td><code>surface.csv</code></td><td>The iced wall as <code>x_m,y_m</code>: the outline plotted on
+          the <a href="validation.html">next page</a>.</td><td>ice stages</td></tr>
+      </table></div>
+
+      <!-- ============================================================ -->
+      <h2 id="timeline">A real campaign, shot by shot <span class="level intermediate">Intermediate</span></h2>
+      <p>The v8.1 glaze package (<code>rg15_glaze_ipw2_v81_20261114</code>, code 82a5d30) ran cases 3.1 and 3.2
+        on Nibi from 14 to 16 November 2026, alongside the rime campaign <code>ms_rg15c</code> (case 3.3).
+        All three were resumed after the node failure of 15 November and all three ended in a failure that
+        was later diagnosed (<code>docs/NIBI_RETURN_2026-11-16.md</code>,
+        <code>docs/PHYSICS_REVIEW.md</code> 2026-11-17). The numbers below come straight from the sealed
+        receipts and summaries.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/campaign_timeline.png" alt="Ice mass in grams per metre of span at each shot end for cases 3.1, 3.2 and 3.3, with deform and remesh markers and the points where each run stopped"></div>
+        <figcaption><b>Figure 3.</b> Total ice (solid ice plus ice still held in the phase columns) at each shot
+          end. Open circles: the fluid mesh was deformed at that shot end; filled squares: remeshed. Every shot
+          after the first was remeshed. In ten of the eleven cases the reason recorded in
+          <code>adapt/quality.json</code> is "wall vertices changed" (wall refinement or front merging altered
+          the wall, which a deformation cannot follow); at the end of 3.1 shot 3 both deformation methods were
+          tried and refused because the predicted y⁺ (2.05 and 2.09) exceeded twice the target.
+          <b>(1)</b> Case 3.1 grew ice to 1200 s (183.0 g/m), then the final adaptation failed with a
+          self-intersecting wall layer across a closed crevice. <b>(2)</b> Case 3.2 stopped inside shot 6 at
+          926 s on an energy-audit failure caused by a degenerate fill triangle; its last recorded mass is the
+          830 s value, 130.8 g/m. <b>(3)</b> The rime run reached 1030 s (163.2 g/m) and stopped in the
+          wall refinement before shot 7. The three curves almost coincide: at these conditions nearly all
+          impinging water ends up as ice, so mass is a weak discriminator between the regimes; the shapes
+          differ (<a href="validation.html#rg15">Step 12</a>). Data: <code>shot_NN/ice/summary.json</code>,
+          <code>shot_NN/adapt/done.json</code>; script <code>_build/fig_campaign.py</code>.</figcaption>
+      </figure>
+
+      <div class="table-wrap"><table>
+        <tr><th>3.2 shot</th><th>Time [s]</th><th>CFD iterations</th><th>CFD [h]</th><th>Collection [h]</th>
+          <th>Ice [h]</th><th>Total ice [g/m]</th><th>Adaptation</th><th>Wall vertices</th><th>Fluid points</th></tr>
+        <tr><td>1</td><td>0-30</td><td>62,000</td><td>1.88</td><td>0.79</td><td>0.04</td><td>4.87</td><td>DEFORM</td><td>890</td><td>73,506</td></tr>
+        <tr><td>2</td><td>30-230</td><td>42,000</td><td>1.15</td><td>0.60</td><td>0.25</td><td>36.83</td><td>REMESH</td><td>913</td><td>137,609</td></tr>
+        <tr><td>3</td><td>230-430</td><td>62,000</td><td>2.77</td><td>0.60</td><td>0.55</td><td>68.47</td><td>REMESH</td><td>947</td><td>140,741</td></tr>
+        <tr><td>4</td><td>430-630</td><td>62,000</td><td>2.93</td><td>0.31</td><td>0.57</td><td>99.52</td><td>REMESH</td><td>996</td><td>143,460</td></tr>
+        <tr><td>5</td><td>630-830</td><td>62,000</td><td>2.41</td><td>0.31</td><td>0.52</td><td>130.83</td><td>REMESH</td><td>1,067</td><td>150,023</td></tr>
+        <tr><td>6</td><td>830-(926)</td><td>62,000</td><td>1.60</td><td>0.27</td><td>failed</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+      </table></div>
+      <p>CFD hours are SU2 solver time summed over the blocks (<code>solver_seconds</code> in
+        <code>flow/done.json</code>); collection and ice hours are the stages' own elapsed times
+        (<code>collect/audit.json</code>, <code>ice/summary.json</code> → <code>cost.ice_wall_seconds</code>).
+        Adaptation took 21-26 s per shot. The wall carried 890 vertices at the start; wall refinement added
+        vertices at every shot end, and front merging removed some inside shots (8, 18 and 40 vertices in shots
+        3, 4 and 5).</p>
+
+      <figure>
+        <div class="frame"><img src="figures/campaign_cost.png" alt="Stacked bars of hours per shot for CFD, collection, ice growth and adaptation for cases 3.2 and 3.1, and line plots of fluid points and wall vertices after each adaptation"></div>
+        <figcaption><b>Figure 4.</b> Where the time goes. (a, b) Wall-clock hours per shot, stacked by stage,
+          with the accepted CFD iteration count on top. (c, d) Fluid-mesh points and wall vertices after each
+          shot-end adaptation (open marker: deformed; square: remeshed). <b>(1)</b> Collection in case 3.2's
+          first shot took 47 min against 18 min in 3.1 with the same seed count; the logs do not say why, so
+          we only note it. <b>(2)</b> The first remesh nearly doubles the fluid mesh (73,506 to 137,609 points)
+          because the remesher targets y⁺ ≈ 1 with explicit wall layers and refines the trailing edge and
+          wake. <b>(3)</b> Shot 6 of 3.2 has no ice bar: the ice stage failed. CFD dominates every shot; ice
+          growth grows with the shape's complexity (0.04 h in shot 1, 0.5-0.7 h later in 3.1 and 3.2).</figcaption>
+      </figure>
+
+      <figure>
+        <div class="frame"><img src="figures/campaign_cfd_blocks.png" alt="Log residuals of the six SU2 equations over 62,000 iterations for case 3.2 shots 1 and 4, with block boundaries and qualified blocks marked"></div>
+        <figcaption><b>Figure 5.</b> CFD in sealed blocks, case 3.2. Dotted lines are block ends (2,000, then
+          every 10,000 iterations); shaded is the first-order startup; "Q" marks blocks qualified by the
+          windowed gates (<code>gate.json</code>). <b>(1)</b> Shot 1 converges smoothly to residuals near
+          10⁻¹⁶; the gates qualify blocks 6 and 7 and the shot is accepted at 62,000 iterations.
+          <b>(2)</b> In shot 4 every residual stops falling after about 5,000 iterations and stays exactly
+          level (worst residual -3.602 in every block, from the log). The windowed gates treat residuals only
+          as a divergence alarm, and lift, drag and the wall profiles stopped changing, so shot 4 was accepted
+          at the same count. A flat plateau like this means the iteration has stalled, not that it has
+          converged in the usual sense; the project's documents do not diagnose it, so it is recorded
+          here as an open observation. The shot-4 history after the resume is the re-run block; the
+          interrupted one was set aside (Figure 2, call-out 6).</figcaption>
+      </figure>
+
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>These are integration results. No run in this campaign completed; each stopped on a defect that
+            was then fixed on main (R40, R41 in <code>docs/GLAZE_ROBUSTNESS.md</code>, and the solid cavity
+            fix for rime in <code>docs/PHYSICS_REVIEW.md</code> 2026-11-17). The fixes were checked by local
+            replays without CFD.</li>
+          <li>Timings depend on the node, the rank count (16) and the SU2 build (8.4.0); they are not
+            benchmarks.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="seals">Seals, resume and identity checks <span class="level advanced">Advanced</span></h2>
+      <p>Three tiny functions carry the whole restart logic. They live at the top of
+        <code>icing/campaign.py</code> and the glaze module imports them.</p>
+<pre><code class="language-python">def _seal(folder, files, **extra):
+    atomic_json(folder / 'done.json', _plain(dict(files={k: digest(folder / k) for k in files}, **extra)))
+
+
+def _done(folder):
+    if not (folder / 'done.json').is_file():
+        return False
+    for name, value in _read(folder / 'done.json')['files'].items():
+        if digest(folder / name) != value:
+            raise ValueError(f'Sealed file changed: {folder / name}')
+    return True
+
+
+def _fresh(folder):
+    """A stage folder must be new; an unsealed existing one is preserved for review."""
+    if folder.exists():
+        raise RuntimeError(f'Incomplete stage {folder}; preserved for review, not overwritten')
+    folder.mkdir(parents=True)</code></pre>
+      <div class="code-src">icing/campaign.py, _seal(), _done(), _fresh()</div>
+      <p><code>_seal</code> writes the receipt <em>last</em>, after every listed file exists. It goes through
+        <code>integrity.atomic_json</code>, which writes to a <code>.tmp</code> file, flushes it to disk with
+        <code>fsync</code> and then renames it into place. A crash therefore leaves either no receipt or a
+        complete one, never half of one. <code>_done</code> does not just test that the receipt exists: it
+        re-hashes every listed file, so a result that was edited or corrupted after sealing stops the run with
+        "Sealed file changed". <code>_fresh</code> is the guard for stages that must start from nothing: a
+        leftover folder is refused, not overwritten.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 820 300" role="img" aria-label="Chain of hashes from result files to stage receipts to the shot receipt">
+          <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+          <rect x="20" y="20" width="200" height="120" rx="8" class="d-box"/>
+          <text x="120" y="44" text-anchor="middle" class="d-text" font-weight="700">ice/</text>
+          <text x="40" y="70" class="d-muted">history.json</text><text x="40" y="90" class="d-muted">surface.json</text>
+          <text x="40" y="110" class="d-muted">summary.json</text><text x="40" y="130" class="d-muted">surface.csv</text>
+          <rect x="20" y="160" width="200" height="120" rx="8" class="d-box"/>
+          <text x="120" y="184" text-anchor="middle" class="d-text" font-weight="700">flow/</text>
+          <text x="40" y="210" class="d-muted">restart_flow.dat</text><text x="40" y="230" class="d-muted">surface_flow.vtu</text>
+          <text x="40" y="250" class="d-muted">history.csv, flow.cfg</text><text x="40" y="270" class="d-muted">mesh.su2, assessment.json</text>
+          <rect x="300" y="45" width="210" height="70" rx="8" class="d-warm"/>
+          <text x="405" y="72" text-anchor="middle" class="d-text">ice/done.json</text>
+          <text x="405" y="94" text-anchor="middle" class="d-muted">sha256 of the 4 files</text>
+          <rect x="300" y="185" width="210" height="70" rx="8" class="d-accent"/>
+          <text x="405" y="212" text-anchor="middle" class="d-text">flow/done.json</text>
+          <text x="405" y="234" text-anchor="middle" class="d-muted">sha256 of 7 files + iterations</text>
+          <rect x="590" y="110" width="210" height="80" rx="8" class="d-ok"/>
+          <text x="695" y="140" text-anchor="middle" class="d-text">shot_05/done.json</text>
+          <text x="695" y="162" text-anchor="middle" class="d-muted">sha256 of flow, collect,</text>
+          <text x="695" y="180" text-anchor="middle" class="d-muted">ice and adapt done.json</text>
+          <path d="M220,80 H296" class="d-arrow" marker-end="url(#ah2)"/>
+          <path d="M220,220 H296" class="d-arrow" marker-end="url(#ah2)"/>
+          <path d="M510,80 L586,135" class="d-arrow" marker-end="url(#ah2)"/>
+          <path d="M510,220 L586,165" class="d-arrow" marker-end="url(#ah2)"/>
+          <text x="560" y="250" class="d-muted">ice/progress.json also stores</text>
+          <text x="560" y="268" class="d-muted">sha256(flow/done.json) and</text>
+          <text x="560" y="286" class="d-muted">sha256(collect/done.json) as its anchor</text>
+        </svg></div>
+        <figcaption><b>Figure 6.</b> Seals form a chain. Each stage receipt fingerprints its files; the shot
+          receipt fingerprints the four stage receipts. A CFD block's receipt adds an <em>anchor</em> (seed
+          hash, start and end iteration, order), and the ice stage's pointer file stores the hashes of the flow
+          and collection receipts it was computed from, so an ice checkpoint can never be resumed against
+          different loads ("Refusing a different glaze restart").</figcaption>
+      </figure>
+
+      <h3>Two-slot checkpoints inside the ice stage</h3>
+      <p>The ice stage of one shot runs 50 increments and can take hours, so it is not "all or nothing".
+        After increment <i>n</i> the state goes into <code>slot_{n mod 2}</code>, then
+        <code>progress.json</code> is atomically rewritten to name that slot, its hash, the tick count and the
+        current increment length. The other slot still holds increment <i>n</i>-1. If the job dies while
+        writing a slot, the pointer still names the previous, complete one. On restart the stage reads the
+        pointer, verifies the slot's hash ("Corrupt latest glaze checkpoint" otherwise) and continues. Time is
+        counted in integer ticks of the thermal step (200 ticks per second at 5 ms), so a shot of 200 s ends
+        exactly at 200 s and not at 199.99999.</p>
+
+      <h3>Identity: refusing changed inputs</h3>
+      <p>Before any stage runs, <code>check_identity</code> compares the inputs with the record stored in
+        <code>results_32/campaign.json</code> at the first start. The record has two parts:</p>
+      <ul>
+        <li><b>computation</b>: a hash of the campaign file without its revisable gate limits, the hashes of
+          the nodal case, the CFD template and the seed restart, the schedule, the ice policy, the seeds per
+          bin, the SHA-256 of the SU2_CFD executable and the MPI rank count. Any change: "Campaign inputs,
+          executable or rank count changed; start a new output folder".</li>
+        <li><b>gates</b>: the CFD acceptance limits (<code>REVISABLE_CFD</code>). These decide acceptance
+          but never change a computed block, so they may change mid-campaign, but only with a
+          <code>gate_revision</code> record naming who authorised it, when and why. The revision is appended
+          to the log in <code>campaign.json</code> and the stored blocks are re-judged under the new limits.</li>
+      </ul>
+      <p>The model code itself is guarded one level down. Every thermal checkpoint stores a digest of the
+        executable model source (<code>integrity.model_sources</code>: an AST hash with comments and docstrings
+        stripped). Loading a checkpoint written by different model code is refused. The orchestration
+        modules (<code>campaign.py</code>, <code>hpc.py</code>, <code>glaze_campaign.py</code>, listed in
+        <code>ORCHESTRATION_SOURCES</code>) are exempt, because "they schedule and gate work but compute no
+        physics" (<code>campaign.load_state</code>, <code>glaze_campaign.load_glaze_state</code>).</p>
+
+      <h3>Setting aside incomplete work</h3>
+      <p>When the scheduler kills a job in the middle of an SU2 block, that block folder exists but has no
+        seal. The next job would refuse it ("Incomplete CFD block ... preserved for review"). The cure is to
+        <b>rename, never delete</b>: <code>campaign.set_aside_incomplete</code> (and the cluster script
+        <code>hpc/nibi/resume.sh</code>) renames only the one trailing unsealed block of each unfinished shot to
+        <code>block_NNNNNNN.interrupted_&lt;UTC time&gt;</code> and logs it. That is exactly what happened in
+        shot 4 of case 3.2 on 15 November (Figure 2, call-out 6). Any other unsealed block is refused for
+        manual review. The glaze adaptation stage, which is a pure function of sealed inputs, sets aside its
+        own unsealed earlier attempt as <code>adapt.incomplete_&lt;time&gt;</code>
+        (<code>glaze_campaign._set_aside_incomplete</code>), a fix that came from run glz6_32, where a
+        half-written folder blocked every resubmission.</p>
+
+      <div class="callout why"><div class="callout-title">Why rename instead of delete</div>
+        <p>A failed or interrupted folder is evidence. Several fixes in
+          <code>docs/GLAZE_ROBUSTNESS.md</code> were found by reading such folders. Renaming keeps the evidence
+          and still lets the run continue from the last trustworthy point.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="walltime">Time budgets, walltime and launch faults <span class="level advanced">Advanced</span></h2>
+      <p>A stage killed by the scheduler is lost work, so the campaign tries never to start a stage that
+        cannot finish before the job's deadline. Before each stage it asks <code>hpc.require_time</code>
+        with an estimate. If the estimate does not fit, it raises <code>WalltimeExhausted</code>;
+        <code>run_resumable</code> catches it and exits with status 75; the batch script resubmits the same
+        command, and the new job skips every sealed stage.</p>
+<pre><code class="language-python">RESUBMIT_EXIT_CODE = 75  # EX_TEMPFAIL: stopped cleanly; resubmit the same command.
+
+def require_time(estimate_seconds, *, label='next stage', environ=None, now=None):
+    window = job_window(environ)
+    if window is not None and estimate_seconds &gt; window:
+        raise WalltimeTooShort(f'{label} needs about {estimate_seconds:.0f} s but a whole job allows only '
+                               f'{window:.0f} s; submit with a longer --time (or a smaller --margin)')
+    remaining = seconds_remaining(environ, now)
+    if estimate_seconds &gt; remaining:
+        raise WalltimeExhausted(f'{label} needs about {estimate_seconds:.0f} s but only '
+                                f'{max(remaining, 0.):.0f} s remain before the job deadline')
+    return remaining
+
+def run_resumable(main, *args, **kwargs):
+    try:
+        return main(*args, **kwargs)
+    except WalltimeExhausted as stop:
+        print(f'Stopped cleanly for resubmission: {stop}', file=sys.stderr, flush=True)
+        raise SystemExit(RESUBMIT_EXIT_CODE) from None</code></pre>
+      <div class="code-src">icing/hpc.py, require_time(), run_resumable() (validation of arguments omitted)</div>
+      <p>There are two different "no time" errors. <code>WalltimeExhausted</code> means "not enough time left
+        in <em>this</em> job": resubmit. <code>WalltimeTooShort</code> means "this stage would not fit even in
+        a fresh job": resubmitting would loop forever, so it is a real failure. Any other exception also
+        propagates: "a real failure must not be resubmitted".</p>
+
+      <h3>Where the estimates come from</h3>
+      <p><code>Timings</code> keeps the <em>longest</em> observed duration of each stage kind in
+        <code>timings.json</code> and returns it times a safety factor <code>SAFETY = 1.5</code>. Before a
+        stage kind has been timed, defaults apply (30 min for the first CFD block, 4 h for collection, 20 min
+        per ice increment, 30 min for adaptation). The case 3.2 run ended with:</p>
+<pre><code class="language-json">{ "cfd_2000": 636.2, "cfd_10000": 3023.4, "collect": 2842.0, "ice": 95.2, "adapt": 26.1 }</code></pre>
+      <div class="code-src">runs/nibi/glz81_32 → results_32/timings.json (seconds, rounded)</div>
+      <p>So the next 10,000-iteration block would only start with at least 1.5 × 3,023 s ≈ 76 min left.
+        <code>cfd_block_estimate</code> handles a block length that has never been timed: it scales the first
+        block linearly, but caps the result at half a job window. The reason is in its docstring: scaling a
+        10-iteration pilot block (which is mostly startup and output time) gave 2,100 s against 87 s
+        measured, and two pilots were refused at 8,870 s and 21,045 s. SU2 itself is also bounded:
+        <code>solver_timeout</code> gives it the smaller of its budget and the time left, so a solver stopped at
+        the deadline leaves a recorded <code>timed_out</code> execution rather than an unrecorded kill.</p>
+
+      <h3>MPI launch faults</h3>
+      <p>On Nibi, <code>srun</code> sometimes "started 0 of N tasks" while still exiting 0 (seen in ms_rg15,
+        glz6_32 and msb_pilot on 2026-11-11). <code>run_with_launch_retries</code> recognises a stage folder
+        whose launch never started SU2, renames it <code>*.launch_failed_&lt;time&gt;</code>, logs it in
+        <code>launch_failures.json</code>, waits 120 s and tries again. After 3 failures in one job it raises
+        <code>LaunchUnavailable</code> (a subclass of <code>WalltimeExhausted</code>, so the job resubmits for
+        a fresh allocation); after 9 failures of the same stage it stops for review.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="hpc">Running on the Nibi cluster <span class="level advanced">Advanced</span></h2>
+      <p>Nibi is an Alliance (Digital Research Alliance of Canada) cluster with 192-core nodes, Slurm, and
+        modules for SU2 8.4.0 and Gmsh 4.13.1 (<code>hpc/nibi/README.md</code>). The workflow is built so that
+        what runs there is exactly what was prepared and reviewed on the PC.</p>
+      <ol class="steps">
+        <li><b>Install</b> (<code>hpc/nibi/install.sh</code>). Checks out an exact commit, detached, refusing
+          a checkout with local edits, builds a virtual environment and records it in
+          <code>~/icing/install.json</code>. A one-off toolchain <b>preflight</b>
+          (<code>preflight.sbatch</code> / <code>preflight.py</code>: SU2 CFD and DEF under <code>srun</code>,
+          rough-wall SST, Gmsh, VTK) passed on 2026-11-07 (job 26429985).</li>
+        <li><b>Freeze a package on the PC.</b> A preparation tool (e.g.
+          <code>tools/prepare_rg15_glaze_package.py</code>) writes the case files, the mesh, a
+          <code>run.py</code>, the experiment plan <code>EXPERIMENT_PLAN.txt</code> and a
+          <code>manifest.json</code> with the SHA-256 of every input. <code>run.py</code> checks the manifest
+          before every command, so a frozen input cannot drift.</li>
+        <li><b>Copy and submit</b> (<code>push_package.ps1</code>, then <code>submit.sh</code>).
+          <code>submit.sh</code> copies the package and a read-only snapshot of the installed code into
+          <code>$SCRATCH/icing_runs/&lt;name&gt;</code>, writes <code>provenance.json</code> (commit and
+          hashes) and <code>job.env</code>, and submits <code>run_package.sbatch</code>. The pilot always
+          runs first; the full run only after its <code>COMPLETED</code> file exists.</li>
+        <li><b>Chained jobs</b> (<code>run_package.sbatch</code>). Each job derives
+          <code>ICING_JOB_DEADLINE</code> from the Slurm time limit minus a margin (3,600 s for the RG-15
+          runs), exports the site executables, refuses to continue if they differ from the first job's
+          (<code>executables.json</code>), and runs the package command. Then it acts on the exit status.</li>
+        <li><b>Return.</b> On success <code>run.py</code> bundles a small return archive; on failure the EXIT
+          trap writes <code>FAILED</code> and <code>archive_failure.sh</code> packs everything into
+          <code>failure_&lt;jobid&gt;_return.tar.gz</code>. The user drops returned files into
+          <code>from_nibi/</code>; they are moved, bytes unchanged, to <code>runs/nibi/&lt;run name&gt;/</code>
+          before anything reads them (standing rule in <code>AGENTS.md</code>).</li>
+      </ol>
+<pre><code class="language-bash">case "$status" in
+    0) date -Is &gt; "$run/COMPLETED"; echo "Run complete." ;;
+    75)
+        count="$(wc -l &lt; "$run/jobs.log")"
+        if [ "$count" -ge "$ICING_MAX_JOBS" ]; then
+            echo "Reached $ICING_MAX_JOBS chained jobs; stopped for review" | tee "$run/STOPPED"
+        else
+            next="$(sbatch --parsable --dependency="afterany:$SLURM_JOB_ID" $ICING_SBATCH_ARGS \
+                    "$run/code/hpc/nibi/run_package.sbatch" "$run")" || { echo "resubmission failed" &gt; "$run/FAILED"; exit 1; }
+            echo "$next submitted $(date -Is) after $SLURM_JOB_ID" &gt;&gt; "$run/submissions.log"
+        fi
+        status=0 ;;
+    *) echo "exit $status in job $SLURM_JOB_ID" &gt; "$run/FAILED" ;;
+esac</code></pre>
+      <div class="code-src">hpc/nibi/run_package.sbatch (end of the script)</div>
+      <p>The run ends in exactly one of three marker files: <code>COMPLETED</code>, <code>STOPPED</code> (the
+        chain limit, 8 jobs for the RG-15 runs) or <code>FAILED</code>. A node failure leaves none of them
+        cleanly; <code>resume.sh</code> then checks that the stop was the cluster's fault (a signal exit, not a
+        model error), sets aside the trailing unsealed work and resubmits with the run's own frozen runner.
+        For glz81_32 the record reads: job 27359690 submitted 2026-11-14 20:23, resumed as job 27435273 on
+        2026-11-15 09:42 after the node failure, and <code>FAILED</code> "exit 1 in job 27435273" on
+        2026-11-16 16:26 (<code>runs/nibi/glz81_32/submissions.log</code>, <code>jobs.log</code>,
+        <code>FAILED</code>).</p>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>On the PC you freeze a package and write down, in advance, what you expect it to show. On the
+          cluster a job runs until it is nearly out of time, stops cleanly between stages, and queues its own
+          successor. When something goes wrong for a physics or code reason, the chain stops and everything is
+          packed up and sent home for diagnosis; nothing is retried blindly.</p></div>
+
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>Nibi runs SU2 8.4.0 while the workstation uses 8.5.0. A 172,000-iteration replay matched to
+            about 10⁻⁸ in forces and wall fields (<code>hpc/nibi/README.md</code>), so results may be pooled,
+            but one run must never mix builds; <code>run_package.sbatch</code> enforces that.</li>
+          <li>The prospective experiment plan that every package carries is described on the
+            <a href="validation.html#plans">next page</a>.</li>
+        </ul></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

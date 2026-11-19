@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glaze: phase-aware ice · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 10 · Advanced</div>
+      <h1>Glaze: phase-aware ice</h1>
+      <p class="lede">Near 0&nbsp;°C the water does not all freeze where it lands. It runs back as a film, freezes underneath, melts and refreezes, and can be trapped under thin crusts. This page explains the glaze path of the solver (<code>icing run-coupled</code> and glaze campaigns): water columns that hold ice and liquid together, the promotion of column ice into the CFD-visible wall, melting, crevice sealing, and the machinery that keeps day-long runs alive and replayable.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#why">Why glaze needs more than the rime model</a> <span class="level basic">Basic</span></li>
+          <li><a href="#columns">Phase-aware columns</a> <span class="level basic">Basic</span></li>
+          <li><a href="#realstate">A real glaze state, row by row</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#solve">One coupled solve: columns + solid</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#promotion">From column ice to the CFD wall</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#loop">The glaze shot loop</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#melting">Melting and recession</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#crevice">Fronts that meet: merging and sealing (R40)</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#controls">Glaze controls</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#failures">When an interval fails: capture and replay</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions, status and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="why">Why glaze needs more than the rime model <span class="level basic">Basic</span></h2>
+      <p>The rime path (<a href="solid.html">Step 7</a>, <code>icing run-nodal</code>) assumes a <em>cold</em> world: liquid exists only as a film exactly at 0&nbsp;°C on top of the surface, everything below it is solid and colder than 0&nbsp;°C, and a node that would warm above 0&nbsp;°C is an error. That is a good description of rime, where most water freezes on impact. Glaze breaks every part of it:</p>
+      <ul>
+        <li><strong>A real liquid film.</strong> Only a part of the water freezes; the rest flows downstream, pushed by air shear, pressure gradient and gravity, and freezes somewhere else (<a href="film.html">Step 6</a>).</li>
+        <li><strong>Ice and water in the same place.</strong> Ice grows <em>under</em> the running film. Supercooled droplets can freeze partly on arrival and make a slush cell that is ice and water at 0&nbsp;°C.</li>
+        <li><strong>Melting and refreezing.</strong> Recovery heating, warm water and latent heat can bring ice back to 0&nbsp;°C and melt it.</li>
+        <li><strong>Crusts and trapped water.</strong> A frozen cap can form over water. That water is no longer free to run back.</li>
+      </ul>
+      <p><code>docs/GLAZE_SWIM.md</code> names the target: a SWIM-type model ("shallow-water icing", after Bourgault, Beaugendre and Habashi, 2000, and NASA GlennICE SWIM). It lists the terms such a model needs: a film mass equation, a film energy equation, conduction through film, ice and substrate with latent heat, vapour exchange, crusts, and a rule for when the surface is dry, wet and freezing, or wet and above freezing. The phase-aware path carries each of them in some form; the table in that document says which.</p>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>For glaze the solver stops treating the water film as a single number per wall node. It stacks small cells of water on every node, each knowing how much ice and how much liquid it holds. Heat flows through the stack and into the ice below in one solve. Ice at the bottom of a stack, once thick enough, is handed over to the solid ice that the airflow sees.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="columns">Phase-aware columns <span class="level basic">Basic</span></h2>
+      <p>The central object is <code>phase_columns.PhaseColumns</code>: for every wall row (one per thermal contact node), a column of <em>material cells</em> from the wall (bottom) to the air (top). Each cell stores only two extensive numbers, water mass \( m \) and enthalpy \( H \), per unit span. Temperature and phase follow from them by the same sharp enthalpy law as the solid (<a href="solid.html#enthalpy">Step 7</a>): cold ice below \( H = -mL_f \), a mixed cell at exactly 0&nbsp;°C between \( -mL_f \) and 0, warm liquid above 0.</p>
+<pre><code class="language-python">@dataclass
+class PhaseColumns:
+    mass: np.ndarray  # total water, kg/m span per material cell; bottom -&gt; air
+    enthalpy: np.ndarray  # J/m span, relative to liquid water at Tm
+    lengths: np.ndarray  # surface dual lengths, m
+    time: float = 0.
+
+    def phase(self):
+        # Empty storage cells have no energy or phase; TM is a display sentinel.
+        temperature,liquid,_=equilibrium(self.enthalpy,self.mass,np.where(self.mass==0,1.,0.))
+        return temperature,liquid,self.mass-liquid
+</code></pre>
+      <div class="code-src">icing/phase_columns.py, PhaseColumns</div>
+      <p>The thickness of a cell is its liquid volume plus its ice volume, divided by the row's dual length (the half-panels around the node). Water connectivity is decided by a deliberately strict rule, <code>classify_phase_columns</code>:</p>
+<pre><code class="language-python">_,liquid,ice=state.phase()
+exposed=np.flip(np.cumprod(np.flip(ice==0.,axis=1),axis=1).astype(bool),axis=1)
+basal=np.cumprod(liquid==0.,axis=1).astype(bool)
+return ColumnTopology(np.where(exposed,liquid,0.),np.where(exposed,0.,liquid),
+    np.where(basal,ice,0.),np.where(basal,0.,ice))
+</code></pre>
+      <div class="code-src">icing/phase_columns.py, classify_phase_columns()</div>
+      <p>Read from the top down: liquid in cells with <em>no ice at all</em> between them and the air is <strong>exposed</strong>, free to run back. Read from the bottom up: ice in cells with <em>no liquid at all</em> between them and the wall is <strong>basal</strong>, attached to the solid. Everything else is retained: water under a crust or in a mixed cell, and ice above water. "A mixed cell blocks a proven pure-phase path" (PHASE_AWARE_COLUMNS.md): the model does not guess a permeability.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 300" role="img" aria-label="Four example columns showing basal ice, exposed liquid, mixed cells and crusts">
+          <rect x="40" y="250" width="720" height="30" fill="#d9d4cb" stroke="var(--muted)"/>
+          <text x="400" y="270" text-anchor="middle" class="d-muted">solid: substrate + promoted ice (enthalpy FEM)</text>
+          <!-- col 1 -->
+          <rect x="80" y="220" width="100" height="30" class="d-accent"/>
+          <rect x="80" y="160" width="100" height="60" class="d-ok"/>
+          <text x="130" y="240" text-anchor="middle" class="d-muted">basal ice</text>
+          <text x="130" y="195" text-anchor="middle" class="d-muted">exposed</text>
+          <text x="130" y="210" text-anchor="middle" class="d-muted">liquid</text>
+          <text x="130" y="140" text-anchor="middle" class="d-text">running film</text>
+          <!-- col 2 -->
+          <rect x="250" y="190" width="100" height="60" fill="var(--warm-soft)" stroke="var(--warm)" stroke-dasharray="4 3"/>
+          <text x="300" y="225" text-anchor="middle" class="d-muted">mixed, 0 °C</text>
+          <text x="300" y="140" text-anchor="middle" class="d-text">slush cells</text>
+          <!-- col 3 -->
+          <rect x="420" y="200" width="100" height="50" class="d-ok"/>
+          <rect x="420" y="180" width="100" height="20" fill="var(--accent)" stroke="var(--accent)"/>
+          <text x="470" y="230" text-anchor="middle" class="d-muted">retained liquid</text>
+          <text x="470" y="195" text-anchor="middle" fill="white" font-size="12">crust</text>
+          <text x="470" y="140" text-anchor="middle" class="d-text">water under a crust</text>
+          <!-- col 4 -->
+          <rect x="590" y="150" width="100" height="100" class="d-accent"/>
+          <text x="640" y="205" text-anchor="middle" class="d-muted">basal ice</text>
+          <line x1="580" y1="232" x2="700" y2="232" stroke="var(--warm)" stroke-width="2" stroke-dasharray="6 3"/>
+          <text x="710" y="236" class="d-muted">5 µm</text>
+          <text x="640" y="140" text-anchor="middle" class="d-text">ready to promote</text>
+          <text x="40" y="40" class="d-text">air</text>
+          <text x="40" y="60" class="d-muted">droplets enter the top cell; convection and vapour act on the top face</text>
+          <text x="40" y="80" class="d-muted">only exposed liquid runs back; only basal ice is promoted into the solid</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 1.</b> The four kinds of column state that <code>classify_phase_columns</code> distinguishes. Only basal ice at least <code>min_promotion_thickness</code> = 5&nbsp;µm thick moves into the solid (dashed line in the right column); thinner basal ice waits in its column, fully represented thermally.</figcaption>
+      </figure>
+
+      <p>Two closures shape what the columns look like in practice:</p>
+      <ul>
+        <li><strong>Sharp basal freezing front</strong> (<code>settle_film_ice</code>, control <code>film_ice_settling</code>, default on). Ice formed inside the air-connected film is moved to one pure ice cell at 0&nbsp;°C at the bottom of the film; each cell's liquid stays above it with its own energy. This is "the Messinger/SWIM thin-film assumption: ice accretes on the surface beneath a liquid film that keeps flowing" (docstring). Without it, a top cell cooled to "mixed" was classified as a crust and froze the whole film in place (GLAZE_ROBUSTNESS R5).</li>
+        <li><strong>Bounded cell counts</strong> (<code>consolidate_phase_columns</code>). Runs of same-kind cells are rebinned to <code>depth_cells</code> (4 in the RG-15 packages) without ever merging across a phase interface. Before this, cell counts doubled every interval (R9, R16).</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="realstate">A real glaze state, row by row <span class="level intermediate">Intermediate</span></h2>
+      <figure>
+        <div class="frame"><img src="figures/glaze_columns.png" alt="Glaze ice at 922 s coloured by solid temperature, wall rows coloured by column state, and four example column stacks"></div>
+        <figcaption><b>Figure 2.</b> The returned RG-15 glaze case 3.2 (−4&nbsp;°C air, 25&nbsp;m/s) at 922&nbsp;s, its last valid checkpoint (<code>runs/nibi/glz81_32/package/results_32/shot_06/ice/slot_1</code>). Left: the solid (ice + PLA) coloured by temperature, from −3.7&nbsp;°C to 0&nbsp;°C; dots are wall rows, coloured by state and sized by column thickness. Right: the cells of four rows picked automatically from the data, bottom to top. <b>A</b> (x = −1.4, y = −6.1&nbsp;mm): 0.5&nbsp;µm of basal ice under 5.8&nbsp;µm of running film: textbook glaze. <b>B</b>: five mixed cells (2.6&nbsp;µm) at 0&nbsp;°C, which block both runback and promotion. <b>C</b>: 162&nbsp;µm of water and no ice on the lower surface, where runback collects. <b>D</b>: 294&nbsp;µm of basal ice at the ice tip, still in its column under 1.2&nbsp;µm of water. In the whole state: 1.38&nbsp;g/m of basal ice in 880 rows, 0.30&nbsp;g/m of exposed liquid in 43 rows, 4.5&nbsp;mg/m of retained water in 10 rows. Script <code>_build/fig_glaze.py</code>.</figcaption>
+      </figure>
+      <p>Row D deserves a word. Basal ice thicker than 5&nbsp;µm is normally promoted, but each promotion pass is capped and throttled where the wall cannot accept the deposit (next section). The checkpoint does not record which limit held this row. The measured column-ice statistics of PHYSICS_REVIEW.md (2026-11-16) found the same signature in other states: a few rows at a sharp feature holding hundreds of micrometres of waiting ice. That observation is why criterion H6 was restated (below).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="solve">One coupled solve: columns + solid <span class="level intermediate">Intermediate</span></h2>
+      <p><code>coupled_phase_columns.advance_coupled_columns</code> assembles the 2D enthalpy solid and every column into <em>one</em> implicit sharp-enthalpy system and hands it to <code>advance_enthalpy</code> (the solver of <a href="solid.html#enthalpy">Step 7</a>). Each column's bottom cell is bonded to its wall node with conductance \( G = 2k\,L/\Delta z \) (half-cell resistance only, i.e. perfect bonding), and the contact block \( G\left(\begin{smallmatrix}1&amp;-1\\-1&amp;1\end{smallmatrix}\right) \) cancels exactly, so contact heat is internal. At the top face of each column act convection to the recovery temperature (Robin condition behind the top half-cell), an optional flux, and vapour exchange:</p>
+      $$ \dot m_v = g\,\big(\rho_{sat}(T_s) - \rho_\infty\big), \qquad g = \frac{h}{\rho_{air}\,c_{p,air}}, $$
+      <p>with \( \rho_{sat} \) over liquid (Buck) or ice (Murphy-Koop) depending on the top cell's phase, linearised about the start-of-step temperature (semi-implicit). Every evaporated kilogram leaves with \( L_v + c_v(T_s - T_m) \); taken from an ice crust this automatically becomes the heat of sublimation (GLAZE_SWIM.md).</p>
+      <p>Two numerical decisions in this function came from real failures:</p>
+      <ul>
+        <li><strong>Thin-film limit.</strong> A column thinner than 1&nbsp;µm, or thinner than 20&nbsp;µm with Biot number \( h\,\delta/k &lt; 0.02 \), gets no depth unknowns. Its water and enthalpy join the wall node's inventory for the solve (it is isothermal with the wall to within that Biot number) and it takes its share back afterwards. This replaced nearly massless depth unknowns behind stiff-contact failures (R1, R2, R11, R17, R19).</li>
+        <li><strong>Mass-limited sinks.</strong> A film that would evaporate completely within a step gets an explicit sink equal to exactly the latent cost of the water it holds (invariant I10: no sink removes more than its inventory).</li>
+      </ul>
+      <p>Each geometry interval (4&nbsp;s) is advanced in sub-steps of <code>thermal_substep</code> = 0.25&nbsp;s by <code>collected_coupled_melt._glaze_substep</code>: deposit droplets into the top cells, settle impact ice, run back the exposed film and solve the coupled conduction/phase/vapour system, settle again, consolidate.</p>
+<pre><code class="language-python">incoming=dt*np.asarray(nodal_mass_rate,float)
+energy=incoming*CW*(env.droplet_temperature-TM)+dt*np.asarray(nodal_kinetic_rate,float)
+columns=deposit_phase_columns(state.columns,incoming,energy)
+if film_ice_settling:
+    columns,impact_settled=settle_film_ice(columns)
+...
+evolved,transport,thermal=advance_runback_thermal_history(intermediate,boundary,dt,
+    edge_shear,edge_force, transport_controls=dict(...), thermal_controls=dict(...))
+if film_ice_settling:
+    columns,settled=settle_film_ice(evolved.columns);evolved=replace(evolved,columns=columns)
+evolved=replace(evolved,columns=consolidate_phase_columns(evolved.columns,depth_cells,max_cells=max_cells))
+</code></pre>
+      <div class="code-src">icing/collected_coupled_melt.py, _glaze_substep() (simplified)</div>
+      <div class="callout why"><div class="callout-title">Why sub-steps</div>
+        <p>Deposit, runback and freezing are split to first order, so the sub-step sets the splitting error. With one 4&nbsp;s step per interval, "the water of a whole interval ran back before any of it could freeze": on RG-15 shot 1, intervals of 4, 2, 1 and 0.5&nbsp;s gave film inventories of 1.4×10⁻⁸, 3.4×10⁻⁵, 4.8×10⁻⁵ and 4.9×10⁻⁵&nbsp;kg/m (GLAZE_ROBUSTNESS R21). The 0.25&nbsp;s sub-step is the value shown converged on real loads before a package is frozen (invariant I7).</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="promotion">From column ice to the CFD wall <span class="level intermediate">Intermediate</span></h2>
+      <p>The CFD only sees the solid wall. Ice that stays in the columns changes heat flow but not the airflow. <code>column_ice_growth.promote_basal_column_ice</code> moves basal ice into the solid: it takes the fully frozen cells contiguous with the substrate, projects their mass <em>and current enthalpy</em> onto wall panels, grows the wall with the rime path's local vertex-volume kernel (<code>nodal_growth._grow_local_volume</code>), and appends the new elements with <code>enthalpy_growth.append_enthalpy_layer</code>, which copies the old nodal enthalpy verbatim. The remaining column material is remapped to the moved wall row by row (<code>phase_column_remap.remap_phase_columns_local</code>). Mixed cells and ice separated from the wall by water stay in the columns.</p>
+<pre><code class="language-python">topology=classify_phase_columns(state.columns)
+attached=topology.basal_ice_mass&gt;0
+basal=np.where(attached,state.columns.mass,0.).sum(axis=1)/(density*state.columns.lengths)
+attached&amp;=(basal&gt;=min_thickness)[:,None]
+...
+limit=max_fraction*state.columns.lengths
+if not np.any(attached) or not np.any(np.where(attached.any(axis=1),basal,0.)&gt;=trigger_fraction*limit):
+    return ColumnIceGrowth(state,surface,none,none.copy(),0.,0.)
+</code></pre>
+      <div class="code-src">icing/column_ice_growth.py, promote_basal_column_ice() (excerpt)</div>
+      <p>Three thresholds control when this happens, each tied to a failure:</p>
+      <ul>
+        <li><strong><code>min_promotion_thickness</code> = 5&nbsp;µm.</strong> Rows with less basal ice keep it in the column. Promoting sub-micron ice made sliver triangles whose stiffness-to-capacity ratio (~10¹¹) stalled the solver (R7). The CFD wall therefore lags the true ice by less than 5&nbsp;µm, 1&nbsp;% of the 0.5&nbsp;mm sand-grain roughness the CFD already assumes (PHYSICS_REVIEW 2026-11-16).</li>
+        <li><strong><code>promotion_trigger</code> = 0.4 and <code>promotion_cap</code> = 0.5</strong>, fractions of <code>max_fraction</code> × dual length. Nothing is promoted until some row's ice reaches the trigger, and no row promotes more than the cap per pass (at most <code>MAX_PROMOTION_PASSES</code> = 4 passes per call). Promoting every few micrometres gave thousands of sliver triangles with 0.04° angles (R26). The last interval of a shot uses trigger 0, so the next CFD wall lags by less than 5&nbsp;µm.</li>
+        <li><strong>Throttling.</strong> If the growth kernel would push a vertex beyond its panel limit or fold the front, only the rows feeding that vertex are scaled down (factor 0.9 / excess, up to 12 rounds); the rest of the wall still promotes. An all-or-nothing refusal had once stopped promotion on the whole wall (R32, R34).</li>
+      </ul>
+
+      <div class="callout limits"><div class="callout-title">Criterion H6: column ice as a local thickness</div>
+        <p>The v8.1 test plan stated H6 as "column ice at most 2&nbsp;% of the total ice at every shot end". Both returned runs failed it at 30&nbsp;s (3.1: 10.7&nbsp;%, 3.2: 9.0&nbsp;%) and passed later. The analysis in PHYSICS_REVIEW.md (2026-11-16) showed why the share was the wrong measure: early column ice is a sub-5&nbsp;µm layer spread over most of the wall, held there by design, so its <em>share</em> mostly measures elapsed time; meanwhile a local lag of 419&nbsp;µm beside a closing crevice of 3.1 at 1200&nbsp;s was only 0.11&nbsp;% of the total and passed. From package v8.2 H6 reads: at every shot end, no row holds column ice thicker than 50&nbsp;µm. The 50&nbsp;µm is "an engineering resolution bound, not a measured CFD sensitivity". Figure 3 shows the share falling with time in both cases.</p></div>
+
+      <figure>
+        <div class="frame"><img src="figures/glaze_ledger.png" alt="Per-shot glaze ledgers for RG-15 cases 3.1 and 3.2: solid ice, column ice, liquid and solid mesh size"></div>
+        <figcaption><b>Figure 3.</b> Shot-end ledgers of the returned v8.1 runs (<code>results_3N/shot_0N/ice/summary.json</code>). Left: CFD-visible solid ice grows almost linearly to 182&nbsp;g/m (3.1, 1200&nbsp;s) and 130&nbsp;g/m (3.2, 830&nbsp;s; shot 6 of 3.2 stopped at 926&nbsp;s, see <a href="#failures">failures</a>); ice still in the columns stays below 1.5&nbsp;g/m. Centre: the column-ice share starts near 10&nbsp;% and falls to 0.5-1&nbsp;% (log scale); the warmer case 3.1 keeps ten times more liquid in its columns. Right: with <code>solid_remesh</code> on, the conduction mesh stays at 14.1-14.7 thousand nodes, against 63,606 for an older 3.2 run without it. In every completed shot shown, every interval used the active-set solver path and no interval was halved.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="loop">The glaze shot loop <span class="level advanced">Advanced</span></h2>
+      <p>A campaign file with <code>"ice_model": "glaze"</code> (<code>icing run-campaign</code>) reuses the rime campaign's shot structure (<a href="campaign.html">Step 11</a>) and replaces two stages: the ice stage and the shot-end adaptation (<code>glaze_campaign.run_glaze_shots</code>). The clean nodal state is converted once into a glaze history (<code>run_glaze_initial</code> → <code>initialize_from_cold_checkpoint</code>), recording the clean wall for roughness and corner exits.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 400" role="img" aria-label="Glaze shot loop: CFD, collection, ice intervals with sub-steps and geometry steps, solid maintenance, checkpoint, adaptation">
+          <defs>
+            <marker id="gl-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+            <marker id="gl-w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--warm)"/></marker>
+          </defs>
+          <rect x="15" y="20" width="140" height="56" rx="8" class="d-box"/>
+          <text x="85" y="44" text-anchor="middle" class="d-text">warm start + CFD</text>
+          <text x="85" y="62" text-anchor="middle" class="d-muted">run_cfd (SU2)</text>
+          <rect x="15" y="100" width="140" height="56" rx="8" class="d-box"/>
+          <text x="85" y="124" text-anchor="middle" class="d-text">collection</text>
+          <text x="85" y="142" text-anchor="middle" class="d-muted">forcing.npz</text>
+          <line x1="85" y1="76" x2="85" y2="96" class="d-arrow" marker-end="url(#gl-a)"/>
+          <line x1="155" y1="128" x2="196" y2="128" class="d-arrow" marker-end="url(#gl-a)"/>
+          <rect x="200" y="15" width="430" height="300" rx="10" fill="none" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="6 4"/>
+          <text x="215" y="36" class="d-text" font-weight="700">ice stage: run_glaze_ice, intervals of 4 s, fluid mesh held</text>
+          <rect x="215" y="50" width="195" height="150" rx="8" class="d-ok"/>
+          <text x="312" y="70" text-anchor="middle" class="d-text">glaze_interval</text>
+          <text x="225" y="92" class="d-muted">sub-steps of 0.25 s:</text>
+          <text x="225" y="110" class="d-muted">deposit → settle</text>
+          <text x="225" y="128" class="d-muted">runback (exposed cap)</text>
+          <text x="225" y="146" class="d-muted">coupled enthalpy solve</text>
+          <text x="225" y="164" class="d-muted">+ vapour → settle</text>
+          <text x="225" y="182" class="d-muted">consolidate cells</text>
+          <rect x="425" y="50" width="195" height="150" rx="8" class="d-accent"/>
+          <text x="522" y="70" text-anchor="middle" class="d-text">advance_coupled_geometry</text>
+          <text x="435" y="92" class="d-muted">1 melted-element removal</text>
+          <text x="435" y="110" class="d-muted">2 sublimation recession</text>
+          <text x="435" y="128" class="d-muted">3 front merging / sealing</text>
+          <text x="435" y="146" class="d-muted">4 basal promotion (≤ 4 passes)</text>
+          <text x="435" y="164" class="d-muted">5 ice shape (Delaunay)</text>
+          <text x="435" y="182" class="d-muted">mass + energy audit</text>
+          <line x1="410" y1="125" x2="421" y2="125" class="d-arrow" marker-end="url(#gl-a)"/>
+          <rect x="215" y="215" width="195" height="88" rx="8" class="d-box"/>
+          <text x="312" y="237" text-anchor="middle" class="d-text">_maintain_solid</text>
+          <text x="225" y="257" class="d-muted">Gmsh remesh every 500 new</text>
+          <text x="225" y="275" class="d-muted">solid nodes and at shot end</text>
+          <text x="225" y="293" class="d-muted">never ends a run</text>
+          <rect x="425" y="215" width="195" height="88" rx="8" class="d-box"/>
+          <text x="522" y="237" text-anchor="middle" class="d-text">gates + checkpoint</text>
+          <text x="435" y="257" class="d-muted">|mass| ≤ 1e-8 kg/m</text>
+          <text x="435" y="275" class="d-muted">|energy| ≤ 0.01 J/m</text>
+          <text x="435" y="293" class="d-muted">slot_0 / slot_1 + progress.json</text>
+          <line x1="522" y1="200" x2="410" y2="245" class="d-arrow" marker-end="url(#gl-a)"/>
+          <line x1="410" y1="260" x2="421" y2="260" class="d-arrow" marker-end="url(#gl-a)"/>
+          <path d="M425,290 C 300,330 230,330 216,200" stroke="var(--accent)" stroke-width="1.5" fill="none" stroke-dasharray="4 3" marker-end="url(#gl-a)"/>
+          <text x="270" y="335" class="d-muted">next interval</text>
+          <rect x="650" y="50" width="140" height="80" rx="8" class="d-warm"/>
+          <text x="720" y="74" text-anchor="middle" class="d-text">ReducibleStep?</text>
+          <text x="660" y="94" class="d-muted">halve interval (≤ 6×),</text>
+          <text x="660" y="112" class="d-muted">regrow after 4 OK</text>
+          <line x1="630" y1="90" x2="646" y2="90" stroke="var(--warm)" stroke-width="2" marker-end="url(#gl-w)"/>
+          <rect x="650" y="145" width="140" height="80" rx="8" class="d-warm"/>
+          <text x="720" y="169" text-anchor="middle" class="d-text">fatal?</text>
+          <text x="660" y="189" class="d-muted">pickle inputs:</text>
+          <text x="660" y="207" class="d-muted">failure_interval_N.pkl</text>
+          <line x1="720" y1="130" x2="720" y2="141" stroke="var(--warm)" stroke-width="2" marker-end="url(#gl-w)"/>
+          <rect x="200" y="345" width="430" height="46" rx="8" class="d-box"/>
+          <text x="415" y="365" text-anchor="middle" class="d-text">run_glaze_adaptation: wall refinement + deform or remesh the fluid mesh</text>
+          <text x="415" y="382" text-anchor="middle" class="d-muted">onto the exact grown wall, then the next shot</text>
+          <line x1="630" y1="300" x2="560" y2="342" class="d-arrow" marker-end="url(#gl-a)"/>
+        </svg>
+        </div>
+        <figcaption><b>Figure 4.</b> One glaze shot. CFD and collection loads are held for the whole ice stage; inside it, each 4&nbsp;s interval runs the thermal sub-steps, then the geometry operators, then optional solid maintenance, the cumulative gates and an alternating checkpoint. Numbers are the RG-15 v8.1 settings (<code>campaign_32.json</code>: <code>increment</code> 4, <code>thermal_substep</code> 0.25, <code>max_interval_halvings</code> 6, <code>solid_remesh.min_new_nodes</code> 500, <code>mass_gate</code> 1e-8, <code>energy_gate</code> 0.01).</figcaption>
+      </figure>
+
+      <p>The heart of <code>run_glaze_ice</code> is a <code>while</code> loop over intervals. Its error handling encodes the failure taxonomy of invariant I9 ("every failure has a class and a remedy that matches it"):</p>
+<pre><code class="language-python">while True:
+    try:
+        evolved, event = glaze_interval(history, surface, ..., duration=take / ticks_per_second, ...)
+        new_surface, new_history, growth = advance_coupled_geometry(
+            evolved, surface, ...,
+            # The last interval of a shot promotes whatever is ready, so the
+            # CFD wall of the next shot lags by less than min_promotion_thickness.
+            promotion_trigger=0. if ticks + take &gt;= duration_ticks else controls['promotion_trigger'], ...)
+        break
+    except WalltimeExhausted:
+        raise   # out of job time, not a model failure: the next job resumes here
+    except Exception as error:
+        if not isinstance(error, ReducibleStep) or take &lt;= floor:
+            _capture_failure(dest / f'failure_interval_{seq + 1:05d}.pkl', error, history=history, ...)
+            raise
+        take = max(floor, take // 2)
+        ...
+new_history = _maintain_solid(new_history, new_surface, controls, ledger, dest, seq + 1,
+                              last=ticks + take &gt;= duration_ticks)
+...
+residual = (total_water(new_history) - ledger['initial_water']
+            - (ledger['incoming'] - ledger['vapor'] - ledger['runoff'] - ledger['flushed']))
+energy = float(np.sum(new_history.solid_enthalpy) + new_history.columns.enthalpy.sum()
+               - new_history.initial_energy - new_history.external_energy)
+if abs(residual) &gt; p.mass_gate or abs(energy) &gt; p.energy_gate:
+    raise ValueError(f'Cumulative glaze conservation gate failed: mass {residual}, energy {energy}')
+</code></pre>
+      <div class="code-src">icing/glaze_campaign.py, run_glaze_ice() (simplified)</div>
+      <p>The cumulative mass ledger is: water now = water at start + droplets − vapour − runoff − flushed residue. "Flushed" is numerical film thinner than 1&nbsp;pm (<code>DRY_FILM_THICKNESS</code>), removed and recorded rather than redistributed (R23). Each interval writes its history into <code>slot_0</code> or <code>slot_1</code> alternately and then <code>progress.json</code> with the SHA-256 of that history, so an interrupted job always resumes from a complete, verified state.</p>
+      <p>At the shot end, <code>run_glaze_adaptation</code> optionally refines stretched wall panels (<code>wall_refinement</code>, with conservative solid/column transfer in <code>coupled_wall_refinement.py</code>) and deforms or remeshes the fluid mesh onto the exact grown wall (<a href="mesh.html">Step 9</a>). If front merging removed wall vertices during the shot, the fluid mesh cannot be deformed onto the new wall and is regenerated.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="melting">Melting and recession <span class="level advanced">Advanced</span></h2>
+      <p>On the glaze path, melting happens inside the coupled enthalpy solve: a solid node whose enthalpy rises above \( -mL_f \) holds liquid. What happens to that liquid is the job of the first geometry operator, <code>melt_surface.remap_automatic_melt</code>. If no solid node holds liquid it returns at once. Otherwise:</p>
+      <ol>
+        <li><code>melted_geometry.remove_exposed_melt</code> removes triangles that are <em>fully liquid at all three corners</em> and connected to the air through full shared edges ("Point contacts, partial melt and buried liquid do not establish drainage"). Their water and sensible energy keep their element provenance.</li>
+        <li><code>reconstruct_melt_surface</code> traces each old wall vertex inward along its bisector to the new exposed boundary, and validates the swept cells; shapes that would need new corners are rejected, not smoothed.</li>
+        <li><code>coupled_melt_remap.remap_melted_history</code> puts the released water into the columns of the new wall rows and remaps the columns, with mass and energy audits.</li>
+      </ol>
+      <p>This is <strong>whole-element release</strong>. A triangle that is half melted keeps its water in its thermal inventory until it is fully liquid. A PLIC-style reconstruction of a straight interface inside a triangle exists as a geometric component (<code>phase_cut.reconstruct_triangle_phase</code>, PARTIAL_PHASE_INTERFACE.md) but is not connected; GLAZE_SWIM.md lists it as remaining work and notes that it "mainly affects melting histories", since in glaze accretion the air is below freezing.</p>
+      <p>The code also holds an earlier, separate family of melting operators on the <em>cold nodal</em> state, built while the melting design was worked out (MELTING_INTEGRATION.md): <code>heat_recession.solve_heat_recession</code> inverts a known heat per panel into inward wall motion whose removed sensible-plus-latent energy matches it; <code>thermal_recession.advance_thermal_recession</code> couples that to retained-domain conduction; <code>melting_step.advance_melting_step</code> splits runback and melting over one shared time step ("Supports the wet, all-melting branch only"). These are verified building blocks; the glaze campaign uses the coupled-history route above.</p>
+      <p>One more kind of recession is active in the RG-15 glaze packages: <strong>sublimation recession</strong> (<code>sublimation_recession: true</code>). On dry rows, sublimation thins the adjacent ice elements in place (conductivity scaled linearly with density) down to a floor of 100&nbsp;kg/m³ (<code>MIN_SUBLIMATED_DENSITY</code>); with recession on, the density deficit becomes inward wall motion at each geometry step. In the 3.1 state at 1198&nbsp;s, 83 ice elements are below 880&nbsp;kg/m³ and the lowest sit exactly at the 100&nbsp;kg/m³ floor, all on the aft wall (x = 10-299&nbsp;mm), far from the growing horns.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="crevice">Fronts that meet: merging and sealing (R40) <span class="level advanced">Advanced</span></h2>
+      <p>Every wall vertex moves along its own normal. Where the ice surface is concave, neighbouring fronts converge; left alone they fold over each other. <code>front_merging.merge_converging_front</code> (control <code>front_merging</code>) applies the rule of front propagation: overtaken parts of the front disappear. A sub-resolution concave pocket is filled with ice already waiting in its own rows' columns, triangulated on its existing wall nodes, and its interior vertices leave the wall. Conservation is exact: the fill takes the same fraction of each attached basal cell, at that cell's own specific enthalpy.</p>
+      <p>A harder case appears when two lobes grow towards each other: fronts that are <em>not</em> neighbours along the wall meet, closing a crevice with a cavity behind it.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/glaze_crevice.png" alt="Closed crevice between two ice lobes of RG-15 case 3.1 at 1198 s, with waiting column ice per wall row"></div>
+        <figcaption><b>Figure 5.</b> The returned RG-15 glaze 3.1 run at 1198&nbsp;s (<code>runs/nibi/glz81_31/.../shot_07/ice/slot_0</code>), upper horn. Dots: wall rows coloured by the ice waiting in their columns. <b>1</b>: the mouth of the crevice, where wall vertex 471 is 1.6&nbsp;nm from panel 455; the wall run between them encloses 16 panels around a 0.042&nbsp;mm² cavity (the R40 entry reports 1.4&nbsp;nm, 16 panels, 0.04&nbsp;mm² at 1200&nbsp;s). <b>2</b>: rows beside the mouth hold up to 410&nbsp;µm of ice that could not be promoted, the local lag that the restated H6 targets. <b>3</b>: zoom on the mouth; the white sliver is the remaining fluid gap. This wall could not be meshed for the airflow: the run "failed in its last mesh adaptation" (GLAZE_ISSUE_HISTORY 5.9).</figcaption>
+      </figure>
+
+      <p>The closure chosen after this failure (GLAZE_ROBUSTNESS R40, PHYSICS_REVIEW 2026-11-16) is <strong>sealing</strong>: where a wall vertex comes within <code>contact_ratio</code> (0.1) × the local target spacing of a non-neighbouring panel, the crevice is closed by the shortest regular chord across its mouth and the enclosed run leaves the wall, provided the cavity is at most 16 × target². Nothing is created: the ice elements around the cavity each give the same fraction \( f = A_{cav}/(A_{cav} + A_{ice}) \) of their water, at their nodes' own specific enthalpy, to the new elements that fill the cavity. The region ends at one reduced bulk density, i.e. <em>porous ice</em>, with conductivity reduced linearly with density, and the bulk density may not fall below half (<code>min_seal_density_ratio</code> 0.5).</p>
+      <div class="callout limits"><div class="callout-title">What sealing gets wrong, by its own account</div>
+        <p>It is "a homogenization of a sub-resolution void, not a model of its content": trapped air (0.024&nbsp;W/(m&nbsp;K)) would insulate more than the porous ice that replaces it, and trapped water would hold latent heat at 0&nbsp;°C. On the 3.1 state the void fraction is 14&nbsp;% over about 0.26&nbsp;mm². None of the thresholds is calibrated, and no tunnel outline resolves 0.2&nbsp;mm features, so an experiment cannot yet tell a sealed crevice from an open one (PHYSICS_REVIEW 2026-11-16).</p></div>
+      <p>Two related geometry corrections complete the picture. Every fill and remesh is followed by <code>ice_mesh_quality.restore_ice_shape</code> (control <code>ice_shape</code>): conservative edge flips and interior-vertex removal make the ice elements locally Delaunay (O20, R39). And from package v8.3, <code>corner_angle_deg</code> = 60 limits how far a sharp convex corner advances per promoted layer (\( h/\cos 30° = 1.155\,h \)), giving the rounded "fan" of growth normal to the surface instead of a mitred spike (R42; <a href="growth.html">Step 8</a>).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="controls">Glaze controls <span class="level advanced">Advanced</span></h2>
+      <p><code>glaze_campaign.glaze_controls(case)</code> merges the campaign's <code>"glaze"</code> object over <code>GLAZE_DEFAULTS</code> and rejects any unknown key or out-of-range value, so a typo cannot silently fall back to a default. Defaults reproduce earlier behaviour; the RG-15 packages switch several options on.</p>
+      <div class="table-wrap"><table>
+        <tr><th>Control</th><th>Default</th><th>RG-15 v8.1 (campaign_32.json)</th><th>Meaning</th></tr>
+        <tr><td><code>ice_conductivity</code> / <code>liquid_conductivity</code></td><td>2.2 / 0.6</td><td>2.2 / 0.56</td><td>W/(m K) for solid ice and column water</td></tr>
+        <tr><td><code>depth_cells</code>, <code>max_cells</code></td><td>4, 256</td><td>4, 256</td><td>cells per same-phase run; hard budget</td></tr>
+        <tr><td><code>thermal_substep</code></td><td>0.25 s</td><td>0.25 s</td><td>split step for deposit/runback/freeze</td></tr>
+        <tr><td><code>min_promotion_thickness</code></td><td>5 µm</td><td>5 µm</td><td>basal ice below this waits in the column</td></tr>
+        <tr><td><code>promotion_trigger</code>, <code>promotion_cap</code></td><td>0.4, 0.5</td><td>0.4, 0.5</td><td>fractions of max_fraction × dual length</td></tr>
+        <tr><td><code>max_interval_halvings</code></td><td>6</td><td>6</td><td>shortest interval = 4 s / 64</td></tr>
+        <tr><td><code>outlet_panels</code></td><td>[]</td><td>"sharp_corners"</td><td>absorbing runoff exits at the clean wall's sharp corners</td></tr>
+        <tr><td><code>film_ice_settling</code></td><td>true</td><td>true</td><td>sharp basal freezing front</td></tr>
+        <tr><td><code>solid_remesh</code></td><td>null</td><td>{"min_new_nodes": 500}</td><td>Gmsh re-triangulation of promoted ice (<a href="solid.html#remesh">Step 7</a>)</td></tr>
+        <tr><td><code>sublimation_recession</code>, <code>wall_refinement</code></td><td>false</td><td>true, true</td><td>dry-row sublimation moves the wall; shot-end panel splitting</td></tr>
+        <tr><td><code>film_air_coupling</code>, <code>film_inertial_limit</code>, <code>film_forcing_length</code></td><td>null, false, null</td><td>{}, true, "design"</td><td>film/air closures of <a href="film.html">Step 6</a></td></tr>
+        <tr><td><code>front_merging</code></td><td>null</td><td>{}</td><td>pocket fills (and, from later code, sealing)</td></tr>
+        <tr><td><code>ice_shape</code>, <code>corner_angle_deg</code></td><td>true, null</td><td>(code default), not present</td><td>Delaunay ice elements; convex-corner limit (60 from v8.3)</td></tr>
+      </table></div>
+
+      <!-- ============================================================ -->
+      <h2 id="failures">When an interval fails: capture and replay <span class="level advanced">Advanced</span></h2>
+      <p>A glaze shot can run for many hours on the cluster. GLAZE_ISSUE_HISTORY.md records that "every failed run so far stopped on a numerical or representation defect, never on a mass or energy ledger". Finding such a defect from a cluster return is only practical because the failing interval is captured. <code>_capture_failure</code> pickles exactly what the interval was given (history, surface, loads, controls, front-merging settings) into one file; <code>replay_captured_interval</code> re-runs it with the current code:</p>
+<pre><code class="language-python">def replay_captured_interval(path):
+    """Re-run a captured failing interval with the current code; returns (history, surface, event, growth)."""
+    with open(path, 'rb') as stream:
+        inputs = pickle.load(stream)['inputs']
+    controls = inputs.pop('controls')
+    merging = inputs.pop('front_merging', None)     # absent in captures written before front merging
+    history, surface = inputs.pop('history'), inputs.pop('surface')
+    # Captures written before a control existed replay with that control's default.
+    evolved, event = glaze_interval(history, surface, **inputs,
+                                    **{k: controls.get(k, GLAZE_DEFAULTS[k]) for k in keys})
+    new_surface, new_history, growth = advance_coupled_geometry(evolved, surface, ...)
+    return new_history, new_surface, event, growth
+</code></pre>
+      <div class="code-src">icing/glaze_campaign.py, replay_captured_interval() (simplified)</div>
+      <p>The user-facing tool wraps this. No CFD is launched; Gmsh is used only for the optional shot-end adaptation preview:</p>
+<pre><code class="language-bash">cd Icing   # the root of your checkout of the repository
+python tools/replay_glaze_interval.py --capture RESULTS/shot_KK/ice/failure_interval_NNNNN.pkl
+python tools/replay_glaze_interval.py PACKAGE RESULTS KEY SHOT OUT
+</code></pre>
+      <div class="code-src">tools/replay_glaze_interval.py, module docstring (placeholders as written there)</div>
+      <p>The second form resumes a whole returned shot from its last checkpoint and then runs the wall refinement and fluid remesh of the wall it produced. That last step was added after R40: replays that stopped at the end of the ice stage never exercised the remesh of a crevice, and "R40 ended a 26 h run in its last step" (GLAZE_ROBUSTNESS, process lesson 9).</p>
+      <p>A real example is in the returned 3.2 run: <code>shot_06/ice/failure_interval_00025.pkl</code>. Shot 6 stopped at 926&nbsp;s with "Enthalpy conduction global energy audit failed" after six halvings (R41). The cause was a fill element of three almost collinear nodes, area 3×10⁻²⁴&nbsp;m², built by the packaged merge code; its conductance was of order 10¹⁵&nbsp;W/(m&nbsp;K). The current <code>SolidFEM</code> refuses such an element at construction (<a href="solid.html#fem">Step 7</a>), and the merge no longer creates it. PHYSICS_REVIEW.md draws the lesson that the solver "was right to refuse it: its audit is the only check that still meant something".</p>
+      <div class="callout why"><div class="callout-title">Why so much machinery around a thermal solver</div>
+        <p>The state is extensive: mass and enthalpy per cell. Temperature is derived, and "as m tends to 0, temperature becomes arbitrarily sensitive"; at \( H = -mL_f \) and \( H = 0 \) the branch decision is degenerate (GLAZE_ISSUE_HISTORY §2). Micron films on a conducting substrate have contact conductances \( 10^7 \)-\( 10^8 \) times their heat capacity per step. GLAZE_ROBUSTNESS.md turns these facts into twelve invariants (I1-I12) that every operator must satisfy, for example I1 "mass moves with the donor's current specific enthalpy" and I2 "energy without mass enters only through the implicit conduction solve". The ledger in Figure 3 (zero halvings, active-set path in every interval) is the payoff of that work on the returned v8.1 loads.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="limits">Assumptions, status and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li><strong>Local equilibrium.</strong> No metastable supercooled film, nucleation rates or dendritic microstructure in columns or solid (PHASE_AWARE_COLUMNS.md).</li>
+          <li><strong>Depth-only columns.</strong> No lateral connectivity of retained water, no permeability of mixed cells, no mechanical crust attachment or shedding.</li>
+          <li><strong>Perfect bonding and lagged geometry.</strong> Column contact uses only the bottom half-cell resistance; cell thicknesses and conductivities are evaluated at the start of each sub-step.</li>
+          <li><strong>First-order splitting</strong> of deposit, runback and freezing, controlled by the 0.25&nbsp;s sub-step.</li>
+          <li><strong>Whole-element melting.</strong> Partially melted triangles keep their water; PLIC is not connected.</li>
+          <li><strong>Runoff.</strong> Water leaves only through absorbing outlets at sharp corners or by aerodynamic stripping; stripped water is not tracked. The rivulet closure is opt-in and weakly supported (GLAZE_SWIM.md).</li>
+          <li><strong>Sealing and corner limits</strong> are resolution choices, not calibrated constants.</li>
+          <li><strong>Status.</strong> No glaze ice shape has been compared with an experiment as validation. GLAZE_SWIM.md lists "a glaze validation package" as "the decisive gap"; the returned RG-15 runs are integration evidence (<a href="validation.html">Step 12</a>).</li>
+        </ul></div>
+
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p><code>icing/glaze_campaign.py</code> → <code>glaze_controls</code>, <code>run_glaze_initial</code>, <code>run_glaze_ice</code>, <code>_maintain_solid</code>, <code>run_glaze_adaptation</code>, <code>run_glaze_shots</code>, <code>replay_captured_interval</code> · <code>icing/collected_coupled_melt.py</code> → <code>glaze_interval</code>, <code>_glaze_substep</code> · <code>icing/phase_columns.py</code> → <code>PhaseColumns</code>, <code>classify_phase_columns</code>, <code>settle_film_ice</code>, <code>consolidate_phase_columns</code> · <code>icing/coupled_phase_columns.py</code> → <code>advance_coupled_columns</code> · <code>icing/phase_column_runback.py</code>, <code>phase_column_remap.py</code>, <code>phase_column_checkpoint.py</code> · <code>icing/coupled_column_checkpoint.py</code> → <code>CoupledColumnHistory</code> · <code>icing/coupled_melt_mesh.py</code> → <code>advance_coupled_geometry</code> · <code>icing/column_ice_growth.py</code> → <code>promote_basal_column_ice</code> · <code>icing/melt_surface.py</code>, <code>melted_geometry.py</code>, <code>coupled_melt_remap.py</code> · <code>icing/heat_recession.py</code>, <code>thermal_recession.py</code>, <code>melting_step.py</code>, <code>sublimation_recession.py</code> · <code>icing/front_merging.py</code> · <code>icing/coupled_solid_remesh.py</code> · <code>tools/replay_glaze_interval.py</code>. Figures: <code>_build/fig_glaze.py</code>.</p></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

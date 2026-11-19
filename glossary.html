@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+<style>
+  dl.gloss dt { font-weight: 700; margin-top: 1.1em; }
+  dl.gloss dt .see { font-weight: 400; font-size: 13px; color: var(--muted); margin-left: 6px; }
+  dl.gloss dd { margin: .2em 0 0 0; }
+  .letters { display: flex; flex-wrap: wrap; gap: 6px; margin: 1em 0 1.5em; }
+  .letters a { padding: 2px 9px; border: 1px solid var(--border); border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Section 14 · Reference</div>
+      <h1>Glossary</h1>
+      <p class="lede">Terms and symbols used in the guide and in the code, each with a short definition and
+        the page where it is explained.</p>
+      <div class="letters" id="letters"></div>
+      <dl class="gloss" id="gloss">
+        <dt>Absorbing exit (runoff exit) <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>A point on the wall where outgoing film water leaves the model and nothing comes back in. Exits are placed at sharp convex corners of the clean wall; the water and its energy are booked as runoff.</dd>
+        <dt>Anchor <span class="see"><a href="campaign.html">campaign</a></span></dt>
+        <dd>The set of hashes that ties a checkpoint to the inputs, code and library versions that produced it. A restart with a different anchor is refused.</dd>
+        <dt>Backward Euler <span class="see"><a href="solid.html">solid</a></span></dt>
+        <dd>An implicit time step: the new temperatures are solved from equations written at the end of the step. It is stable for any step size, which suits stiff heat conduction.</dd>
+        <dt>Basal ice <span class="see"><a href="glaze.html">glaze</a></span></dt>
+        <dd>Ice in a phase-aware column that is attached to the solid, with no liquid underneath it. Only basal ice can be promoted into the wall the CFD sees.</dd>
+        <dt>β, collection efficiency <span class="see"><a href="droplets.html">droplets</a></span></dt>
+        <dd>Water mass rate landing on a wall piece divided by \(\mathrm{LWC}\,U_\infty\) times its length. It is 0 outside the impingement limits and largest near the stagnation point.</dd>
+        <dt>CFD block <span class="see"><a href="airflow.html">airflow</a>, <a href="campaign.html">campaign</a></span></dt>
+        <dd>A sealed, restartable chunk of SU2 iterations (10,000 in the RG-15 campaigns, 2,000 for the first). Convergence gates are evaluated between blocks.</dd>
+        <dt>CFL substep <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>A time step short enough that film water cannot move more than one panel per step. It keeps the explicit film transport stable and the film thickness non-negative.</dd>
+        <dt>Contact conductance <span class="see"><a href="solid.html">solid</a></span></dt>
+        <dd>The 2D solid's response at the wall nodes, condensed into an effective heat flow per degree. The surface balance uses it to include conduction implicitly.</dd>
+        <dt>Corner sine (scaled Jacobian) <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>The sine of a cell's worst corner angle: 1 for a right angle, near 0 for a collapsed cell. Used as a mesh-quality gate (hard floor 0.10).</dd>
+        <dt>Deform / remesh <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>Two ways to make the CFD mesh follow the new wall. Deforming bends the old mesh with SU2_DEF (RBF or elastic). Remeshing builds a new mesh with explicit wall layers and a Gmsh core. The solver deforms when checks pass and remeshes otherwise.</dd>
+        <dt>Dual cell <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>The piece of wall belonging to one node: half of each wall edge next to it. The conducting (nodal) path stores film and loads on dual cells.</dd>
+        <dt>Enthalpy, enthalpy reference <span class="see"><a href="thermo.html">thermo</a>, <a href="solid.html">solid</a></span></dt>
+        <dd>Energy content measured from liquid water at the melting point \(T_m\) = 273.15 K, which counts as zero. Per kilogram, ice is \(-L_f + c_i(T-T_m)\), liquid is \(c_w(T-T_m)\) and vapour is \(L_v + c_v(T-T_m)\).</dd>
+        <dt>Explicit wall layers <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>Rings of quadrilateral cells offset from the wall during a remesh. The first height comes from the target y+, and the layers grow until they match the local core cell size.</dd>
+        <dt>First-cell height <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>Distance from the wall to the first mesh node off the wall. It sets y+ and must stay controlled as the mesh deforms.</dd>
+        <dt>Freezing fraction \(n\) <span class="see"><a href="basics.html">basics</a>, <a href="thermo.html">thermo</a></span></dt>
+        <dd>New ice divided by all water supplied to a panel over a step (initial film + impingement + incoming runback). \(n=1\) is rime; \(n&lt;1\) leaves a film (glaze).</dd>
+        <dt>Front merging <span class="see"><a href="growth.html">growth</a></span></dt>
+        <dd>Removing wall vertices where two growth fronts converge in a concave pocket, filling the pocket conservatively, so the wall does not fold over itself.</dd>
+        <dt>Frozen package <span class="see"><a href="campaign.html">campaign</a></span></dt>
+        <dd>A run folder whose inputs (case files, meshes, code commit, experiment plan) are fixed by a hash manifest before it is sent to the cluster.</dd>
+        <dt>Glaze ice <span class="see"><a href="basics.html">basics</a>, <a href="glaze.html">glaze</a></span></dt>
+        <dd>Clear, dense ice formed near 0 °C when only part of the water freezes on impact. The rest runs back, often forming horns.</dd>
+        <dt>Growth increment <span class="see"><a href="overview.html#time">overview</a></span></dt>
+        <dd>The step (4 s in the RG-15 campaigns) after which the wall moves once and the solid gains a new layer. Airflow and droplet loads stay frozen within a shot.</dd>
+        <dt>Growth layer / swept cell <span class="see"><a href="growth.html">growth</a>, <a href="solid.html">solid</a></span></dt>
+        <dd>A swept cell is the strip between a wall panel's old and new position in one growth increment. All swept cells of one increment form a growth layer of the conducting solid.</dd>
+        <dt>HTC, heat-transfer coefficient \(h\) <span class="see"><a href="airflow.html">airflow</a></span></dt>
+        <dd>Wall heat flux divided by wall-minus-air temperature, from an SU2 solve with an isothermal wall: \(h = -q_w/(T_w - T_\infty)\), in W/(m²·K).</dd>
+        <dt>Impingement limit <span class="see"><a href="droplets.html">droplets</a></span></dt>
+        <dd>The farthest point on the upper or lower surface that droplets still reach. Beyond it β = 0.</dd>
+        <dt>Inertia parameter \(K\) <span class="see"><a href="droplets.html">droplets</a></span></dt>
+        <dd>\(K = \rho_w d^2 U / (18\,\mu R)\), a Stokes number for a body of radius \(R\). Large \(K\) means droplets hit almost in straight lines.</dd>
+        <dt>Inlet guard <span class="see"><a href="droplets.html">droplets</a></span></dt>
+        <dd>The outer 5 % at each end of the droplet inlet. If a droplet released there hits the wall, the inlet may be too narrow, and the stage stops before ice growth.</dd>
+        <dt>Latent heat of fusion \(L_f\) <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>Heat released when 1 kg of water freezes, about 334 kJ/kg. Removing it is what limits freezing.</dd>
+        <dt>Latent plateau <span class="see"><a href="solid.html">solid</a></span></dt>
+        <dd>In the enthalpy method, the range of enthalpy from \(-L_f\) to 0 per kilogram where the temperature stays at 0 °C while ice and water coexist.</dd>
+        <dt>Lewis analogy <span class="see"><a href="thermo.html">thermo</a></span></dt>
+        <dd>Estimating the evaporation (vapour mass transfer) rate from the heat-transfer coefficient, assuming a Lewis number of one.</dd>
+        <dt>Lubrication film <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>A thin, slow film whose velocity profile follows from a viscous balance between air shear, pressure gradient and gravity. Its flux is \(q = \rho_w[\tau h^2/(2\mu) + F h^3/(3\mu)]\).</dd>
+        <dt>LWC, liquid water content <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>Mass of liquid water per volume of air, in kg/m³ in the solver (0.00052 kg/m³ = 0.52 g/m³ for RG-15).</dd>
+        <dt>MCCS outline <span class="see"><a href="validation.html">validation</a></span></dt>
+        <dd>The measured outer ice envelope across the span of the RG-15 experiments, used as the reference ice shape.</dd>
+        <dt>Merge ratio <span class="see"><a href="growth.html">growth</a></span></dt>
+        <dd>A new panel shorter than this fraction (0.35) of its target length has its two vertices merged into one, placed so the enclosed area does not change.</dd>
+        <dt>Messinger model <span class="see"><a href="thermo.html">thermo</a></span></dt>
+        <dd>The quasi-steady mass and energy balance on each wall panel that decides how much of the arriving water freezes (Messinger, 1953).</dd>
+        <dt>Mitre / round fan <span class="see"><a href="growth.html">growth</a></span></dt>
+        <dd>Two ways a convex corner can advance. A mitre (polygon offset) moves the corner \(h/\cos(t/2)\) and keeps it sharp. A round fan advances it by \(h\) and rounds it, as growth normal to the surface should. Since R42 the solver limits sharp corners towards the fan.</dd>
+        <dt>MVD, median volumetric diameter <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>The droplet diameter that splits the cloud's water mass in half (26.8 µm measured for RG-15).</dd>
+        <dt>Outer-boundary compounding <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>A known limitation: remeshing a remeshed mesh can subdivide the outer boundary again each time. Campaigns avoid it by always passing the original tunnel boundary.</dd>
+        <dt>Phase-aware column <span class="see"><a href="glaze.html">glaze</a></span></dt>
+        <dd>A stack of ice/water cells on one wall row in the glaze model, holding liquid, slush and crusts with their own enthalpy.</dd>
+        <dt>Pilot <span class="see"><a href="campaign.html">campaign</a></span></dt>
+        <dd>A tiny, short version of a campaign, run first to check that every stage works together.</dd>
+        <dt>Polygon offset <span class="see"><a href="growth.html">growth</a>, <a href="mesh.html">mesh</a></span></dt>
+        <dd>Growing a wall while keeping the same vertices: corners stay as sharp as before while panels stretch with the growing radius, which turns a smooth nose into facets.</dd>
+        <dt>Promotion <span class="see"><a href="glaze.html">glaze</a></span></dt>
+        <dd>Moving basal column ice (at least 5 µm thick) into the solid and the CFD-visible wall. It is capped and throttled each pass so the wall stays valid.</dd>
+        <dt>Recovery temperature <span class="see"><a href="thermo.html">thermo</a></span></dt>
+        <dd>\(T_\infty + r U^2/(2 c_{p})\): the temperature the air would reach at the wall from friction heating, with recovery factor \(r\) (0.85 by default). Convection cools the surface towards it.</dd>
+        <dt>Registration <span class="see"><a href="validation.html">validation</a></span></dt>
+        <dd>Where a measured ice outline sits relative to the airfoil (origin, scale, angle). For RG-15 it is unresolved, which limits shape comparisons.</dd>
+        <dt>Rime ice <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>White, opaque ice formed in cold conditions when droplets freeze on impact (\(n = 1\)).</dd>
+        <dt>Runback <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>Unfrozen water flowing along the wall from where it landed, pushed by air shear, pressure gradient and gravity.</dd>
+        <dt>Rusanov flux <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>A simple, robust finite-volume face flux: the average of the two neighbouring fluxes plus dissipation scaled by the largest local wave speed.</dd>
+        <dt>Seal (<code>done.json</code>) <span class="see"><a href="campaign.html">campaign</a></span></dt>
+        <dd>A receipt written when a stage finishes, holding SHA-256 hashes of its outputs. Sealed stages are skipped on resume; unsealed ones are set aside and redone.</dd>
+        <dt>Sealing (of crevices) <span class="see"><a href="glaze.html">glaze</a></span></dt>
+        <dd>Closing a narrow crevice between growing ice fronts and keeping the void as porous ice (glaze rule R40), so ice does not wait indefinitely in a closing gap.</dd>
+        <dt>Seed refinement <span class="see"><a href="droplets.html">droplets</a></span></dt>
+        <dd>Doubling the number of released droplets until total and panel-wise captured water agree within a tolerance over consecutive doublings.</dd>
+        <dt>Set aside <span class="see"><a href="campaign.html">campaign</a></span></dt>
+        <dd>Renaming an unfinished stage folder instead of deleting it, so failed work can still be diagnosed.</dd>
+        <dt>Shear convergence <span class="see"><a href="film.html">film</a></span></dt>
+        <dd>A place where the wall shear points inward from both sides, so the film has nowhere to go and water pools.</dd>
+        <dt>Shot <span class="see"><a href="overview.html#time">overview</a></span></dt>
+        <dd>An interval of icing time (30–200 s) with one CFD solve and one droplet collection at its start, many growth increments, and a mesh adaptation at its end.</dd>
+        <dt>Stefan problem <span class="see"><a href="solid.html">solid</a>, <a href="validation.html">validation</a></span></dt>
+        <dd>A freezing problem with an exact moving-front solution, used to check that the conduction and phase-change numerics converge.</dd>
+        <dt>Stokes number <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>A droplet's stopping distance divided by the body size. It measures how strongly droplets resist turning with the air.</dd>
+        <dt>Supercooled water <span class="see"><a href="basics.html">basics</a></span></dt>
+        <dd>Liquid water below 0 °C, which stays liquid until something starts freezing, such as contact with a wing surface.</dd>
+        <dt>Target spacing <span class="see"><a href="mesh.html">mesh</a></span></dt>
+        <dd>The panel length a wall location should have, from the clean wall's own spacing, limited by local curvature and graded smoothly. Panels longer than the split ratio times target are split.</dd>
+        <dt>Thermal step <span class="see"><a href="overview.html#time">overview</a></span></dt>
+        <dd>The short step (5 ms in the RG-15 campaigns) for film transport, freezing and conduction inside a growth increment.</dd>
+        <dt>Verification / validation <span class="see"><a href="validation.html">validation</a></span></dt>
+        <dd>Verification checks the equations are solved correctly (exact solutions, refinement, conservation). Validation checks they are the right equations, against experiments with known uncertainty.</dd>
+        <dt>Wall-relative warm start <span class="see"><a href="mesh.html">mesh</a>, <a href="airflow.html">airflow</a></span></dt>
+        <dd>Starting the next CFD solve from the previous solution mapped onto the new mesh. Near the wall, a new node samples the old flow at the same distance from the old wall.</dd>
+        <dt>Windowed gate <span class="see"><a href="airflow.html">airflow</a></span></dt>
+        <dd>A convergence test that compares averages over consecutive CFD blocks (loads, HTC, shear, Cp) instead of single snapshots.</dd>
+        <dt>y+ <span class="see"><a href="airflow.html">airflow</a>, <a href="mesh.html">mesh</a></span></dt>
+        <dd>First-cell height in wall units, \(y^+ = u_\tau h_1/\nu\). The RANS wall treatment needs y+ near 1; the solver gates on the largest nodal value.</dd>
+      </dl>
+    </article>
+  </main>
+</div>
+<script>
+  // Build the letter index from the entries.
+  (function () {
+    const dts = [...document.querySelectorAll('#gloss dt')];
+    const seen = new Set(); let html = '';
+    dts.forEach(dt => {
+      const ch = dt.textContent.trim()[0].toUpperCase();
+      const letter = /[A-Z]/.test(ch) ? ch : '#';
+      if (!seen.has(letter)) { seen.add(letter); dt.id = 'l-' + letter; html += `<a href="#l-${letter}">${letter}</a>`; }
+    });
+    document.getElementById('letters').innerHTML = html;
+  })();
+</script>
+</body>
+</html>

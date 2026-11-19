@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The freezing energy balance · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 5 · One icing cycle</div>
+      <h1>The freezing energy balance</h1>
+      <p class="lede">Droplets have hit the wall (Step 4). Now the solver decides, panel by panel, how much of that water freezes, how much stays liquid and runs back, and how warm the surface gets. This one energy balance is what separates rime from glaze ice.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#idea">A box on the wall</a> <span class="level basic">Basic</span></li>
+          <li><a href="#mass">The mass balance</a> <span class="level basic">Basic</span></li>
+          <li><a href="#energy">The energy terms</a> <span class="level basic">Basic</span></li>
+          <li><a href="#budget">A real panel: where the heat goes</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#branches">Rime, glaze and dry panels</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#transition">From rime to glaze</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#code">The phase solve in code</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#vapor">Vapour exchange</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#heat">Recovery heating and the CFD heat-transfer coefficient</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#filmenergy">Film sensible energy</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#nodal">The nodal balance with a conducting solid</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <h2 id="idea">A box on the wall <span class="level basic">Basic</span></h2>
+      <p>Think of one small piece of the wing surface, one <em>panel</em> of the wall polygon. Draw an imaginary box around it, thin enough to hold only the surface layer: the water film, if there is one, and the ice that forms during the time step. This box is the <em>control volume</em>. The solver keeps two ledgers for it: one for water mass, one for energy. Everything that enters must either stay, change phase, or leave.</p>
+      <p>This idea is old. It is usually called the <strong>Messinger model</strong>, after the 1953 analysis of an unheated surface in icing. The solver's own description of it is a "quasi-steady Messinger energy closure" (<code>icing/thermo.py</code>, module docstring). <em>Quasi-steady</em> means the box has no heat storage of its own: in each short time step, heat in equals heat out.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 430" role="img" aria-label="Control volume on one wall panel with mass and energy arrows">
+          <defs>
+            <marker id="tm-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+            <marker id="tm-w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--warm)"/></marker>
+            <marker id="tm-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ok)"/></marker>
+          </defs>
+          <rect x="60" y="300" width="680" height="70" fill="#d9d4cb" stroke="var(--muted)" stroke-width="1"/>
+          <text x="400" y="345" text-anchor="middle" font-size="14" fill="#333" font-family="Inter, sans-serif">substrate or existing ice</text>
+          <rect x="230" y="270" width="340" height="30" class="d-accent"/>
+          <text x="400" y="290" text-anchor="middle" class="d-text">new ice ṁ_ice</text>
+          <path d="M60,262 C 150,258 200,252 230,250 L 570,250 C 610,252 680,258 740,262 L740,270 L60,270 Z" fill="var(--ok-soft)" stroke="var(--ok)" stroke-width="1.5"/>
+          <text x="400" y="264" text-anchor="middle" class="d-muted">film at Tm (glaze only)</text>
+          <rect x="230" y="175" width="340" height="140" fill="none" stroke="var(--text)" stroke-width="1.6" stroke-dasharray="7 5"/>
+          <text x="238" y="194" class="d-muted">control volume = one panel, length L</text>
+          <line x1="300" y1="40" x2="330" y2="172" class="d-arrow" marker-end="url(#tm-a)"/>
+          <circle cx="297" cy="30" r="5" fill="var(--accent)"/>
+          <text x="40" y="52" class="d-text">① impinging water ṁ_imp</text>
+          <text x="40" y="70" class="d-muted">sensible ṁ c_w (T_d − T_m), negative</text>
+          <text x="40" y="88" class="d-muted">plus impact kinetic energy</text>
+          <line x1="430" y1="172" x2="430" y2="70" stroke="var(--warm)" stroke-width="2" marker-end="url(#tm-w)"/>
+          <text x="440" y="44" class="d-text">② convection h (T_s − T_rec)</text>
+          <text x="440" y="62" class="d-muted">T_rec = T_∞ + r U²/(2 c_p)</text>
+          <path d="M520,172 C 530,140 515,120 540,100" stroke="var(--warm)" stroke-width="2" fill="none" stroke-dasharray="4 3" marker-end="url(#tm-w)"/>
+          <text x="552" y="112" class="d-text">③ evaporation ṁ_ev</text>
+          <text x="552" y="130" class="d-muted">carries L_v + c_v (T_s − T_m)</text>
+          <line x1="120" y1="232" x2="226" y2="232" stroke="var(--ok)" stroke-width="2.4" marker-end="url(#tm-g)"/>
+          <text x="66" y="220" class="d-text">④ runback in</text>
+          <line x1="574" y1="232" x2="690" y2="232" stroke="var(--ok)" stroke-width="2.4" marker-end="url(#tm-g)"/>
+          <text x="600" y="220" class="d-text">⑤ runback out</text>
+          <line x1="300" y1="318" x2="300" y2="400" stroke="var(--warm)" stroke-width="2" marker-end="url(#tm-w)"/>
+          <text x="312" y="392" class="d-text">⑥ conduction into the solid, q_sub</text>
+          <text x="585" y="290" class="d-text">⑦ latent heat</text>
+          <text x="312" y="418" class="d-muted">⑦ new ice leaves the box with enthalpy −L_f + c_i (T_s − T_m)</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 1.</b> The control volume on one wall panel. Mass enters with the droplets ① and with water running back from the upstream neighbour ④. It leaves as ice ⑦, as vapour ③, or as runback to the downstream neighbour ⑤; whatever remains is the film. Energy leaves by convection ② (with the air's recovery heating counted inside it), with the vapour ③ and by conduction into the solid ⑥. Freezing ⑦ releases latent heat. Runback ④⑤ is the subject of <a href="film.html">Step 6</a>; the solid ⑥ of <a href="solid.html">Step 7</a>.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>Freezing water releases heat. The air carries heat away. If the air can take away all the heat that freezing releases, all the water freezes on the spot: that is <strong>rime</strong>. If not, only part of it freezes and the rest stays liquid at 0 °C and is blown back along the surface: that is <strong>glaze</strong>. The energy balance on each panel decides which.</p></div>
+
+      <h2 id="mass">The mass balance <span class="level basic">Basic</span></h2>
+      <p>Water arrives in two ways: droplets hit the panel, and liquid runs in from a neighbour. It can leave in three: it freezes, it evaporates, or it runs on. The rest stays as film. In symbols, over one time step and per metre of span (all masses are kg/m, because the solver is two-dimensional):</p>
+      $$ M_\text{film,old} + M_\text{imp} + M_\text{in} = M_\text{ice} + M_\text{film,new} + M_\text{ev} + M_\text{out}. $$
+      <p>The local phase solve only sees the water that is already on the panel. The solver calls that <code>available</code>: old film (after transport) plus the new impingement. It then splits it three ways, as MODELS.md writes it:</p>
+      $$ M_\text{available} = M_\text{ice} + M_\text{film} + M_\text{evaporated}. $$
+      <p>Every panel is checked after each call. <code>accrete()</code> in <code>icing/thermo.py</code> raises an error if <em>supplied = ice + final film + evaporation + outgoing runback</em> fails on any panel by more than \(10^{-10}\) of the total water ("Local surface-water ledger did not close"). The same holds for the whole wall.</p>
+
+      <h3>Freezing fraction</h3>
+      <p>The classic summary number is the <strong>freezing fraction</strong> \(n\): the share of incoming water that freezes. The code defines it in <code>accrete()</code> as</p>
+      $$ n = \frac{M_\text{ice}}{M_\text{film,old} + M_\text{imp} + M_\text{in}} , $$
+      <p>new ice divided by everything supplied to the panel during the increment, counting gross incoming runback (<code>ThermalResult.freezing_fraction</code>). MODELS.md notes that this becomes the usual freezing fraction in steady conditions, but while film is still being stored it depends on the length of the observation interval. \(n = 1\) is rime. \(0 &lt; n &lt; 1\) is glaze. Evaporation makes \(n\) slightly less than 1 even when no liquid is left, because evaporated water never becomes ice.</p>
+
+      <h2 id="energy">The energy terms <span class="level basic">Basic</span></h2>
+      <p>To add up energies of water, ice and vapour, you need a common zero. The solver takes <strong>liquid water at the melting temperature</strong> \(T_m = 273.15\) K as zero enthalpy. PHYSICS_REVIEW.md (section "Governing thermal balance") states this rule for the whole project. Relative to that reference:</p>
+      <div class="table-wrap"><table>
+        <tr><th>Phase</th><th>Specific enthalpy (J/kg)</th><th>Meaning</th></tr>
+        <tr><td>liquid water</td><td>\(c_w (T - T_m)\)</td><td>negative for supercooled droplets</td></tr>
+        <tr><td>ice</td><td>\(-L_f + c_i (T - T_m)\)</td><td>freezing removes \(L_f\); colder ice even less</td></tr>
+        <tr><td>vapour</td><td>\(L_v + c_v (T - T_m)\)</td><td>evaporation must supply \(L_v\)</td></tr>
+      </table></div>
+      <p>The constants sit at the top of <code>icing/thermo.py</code>: \(L_f = 333\,700\) J/kg, \(L_v = 2.501\times10^6\) J/kg, \(c_w = 4180\), \(c_i = 2100\), \(c_v = 1870\) J/(kg K), \(c_{p,\text{air}} = 1005\) J/(kg K), and \(T_m = 273.15\) K.</p>
+      <p>With this zero, the balance in MODELS.md reads</p>
+      $$ \underbrace{E_\text{drop} + E_\text{kinetic}}_\text{sources} = Q_\text{convection} + Q_\text{substrate} + E_\text{evaporated} + E_\text{ice} $$
+      <p>with \(E_\text{ice} = M_\text{ice}\,[-L_f + c_i(T_s - T_m)]\) and \(E_\text{evaporated} = M_\text{ev}\,[L_v + c_v(T_s - T_m)]\). Since \(E_\text{ice}\) is negative, freezing acts as a heat source for the box. One by one:</p>
+      <ul>
+        <li><strong>Droplet sensible heat</strong> \(M_\text{imp}\,c_w (T_d - T_m)\). Supercooled droplets arrive colder than \(T_m\), so this is negative: the panel must warm them up to 0 °C.</li>
+        <li><strong>Impact kinetic energy</strong>. The droplet tracker delivers it per panel (<code>kinetic_rate</code> in <code>collect/forcing.npz</code>), computed from the actual impact speed, not the free-stream speed.</li>
+        <li><strong>Convection</strong> \(h\,L\,\Delta t\,(T_s - T_\text{rec})\). \(h\) is the heat-transfer coefficient from the CFD (<a href="airflow.html">Step 3</a>). \(T_\text{rec} = T_\infty + r U_\infty^2/(2c_p)\) is the recovery temperature with \(r = 0.85\) (<code>ThermalEnvironment.recovery_temperature</code>). The \(r U^2/2c_p\) part is air heating by friction near the wall.</li>
+        <li><strong>Evaporation</strong> mass \(M_\text{ev}\) from a Lewis-analogy law (see <a href="#vapor">below</a>), leaving with vapour enthalpy.</li>
+        <li><strong>Substrate</strong> heat \(Q_\text{sub}\): zero by default on the panel path, a fixed conductance if asked for, or a real conduction solve on the nodal path (<a href="#nodal">below</a>).</li>
+        <li><strong>Latent heat</strong>, hidden inside \(E_\text{ice}\): each kilogram that freezes gives \(L_f\), plus \(c_i(T_m - T_s)\) if the new ice cools below \(T_m\).</li>
+      </ul>
+
+      <div class="callout why"><div class="callout-title">Why a single enthalpy reference</div>
+        <p>With one zero for all phases, evaporating ice automatically costs \(L_v + L_f\) and freezing automatically gives \(L_f\); no separate "phase switch" is needed. PHYSICS_REVIEW.md (2026-11-06 entry) records exactly this: "evaporating ice costs about Lv+Lf per kg without a separate switch". It also makes the energy ledgers of different modules add up, because they all use the same zero.</p></div>
+
+      <h2 id="budget">A real panel: where the heat goes <span class="level intermediate">Intermediate</span></h2>
+      <p>To see the sizes of these terms, take the panel with the largest impingement on the real iced RG-15 airfoil: campaign <code>glz81_32</code> (IPW-2 case 3.2), shot 6. Its forcing comes from the saved files <code>results_32/shot_06/collect/forcing.npz</code> and <code>flow/surface_flow.vtu</code>, read with the same <code>wall_fields()</code> call the campaign uses. On that panel the heat-transfer coefficient is 257 W/(m² K) and the droplets bring 10.3 g/(m² s) of water (collection efficiency about 0.79 at 25 m/s and 0.52 g/m³). The script then calls <code>thermo.phase_cell()</code> for one second with only the panel's own impingement: no runback, no conduction.</p>
+      <p>The free-stream conditions are those of the RG-15 campaigns: 25 m/s and 0.52 g/m³ in all three cases; only the temperature differs. The rime campaign <code>ms_rg15c</code> ran at 263.15 K, case 3.2 at 269.15 K and case 3.1 at 271.15 K (the <code>nodal_case</code> JSON files). To isolate the effect of temperature, the figure keeps the shot-6 airflow and impingement and changes only the air and droplet temperature. The 263.15 K and 271.15 K bars are therefore "what if" calculations on the case 3.2 geometry, not results of those campaigns.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/thermo_energy_budget.png" alt="Stacked bars of heat gains and losses on the RG-15 stagnation panel at three air temperatures"></div>
+        <figcaption><b>Figure 2.</b> Energy budget of the stagnation panel from <code>thermo.phase_cell()</code>, in W/m². For each temperature, the left bar is heat into the box and the right bar heat out; they are equal because the balance closes (residual below \(4\times10^{-5}\) W/m²). ① At 263.15 K latent heat of freezing is almost the whole heat input: all water freezes and the dry surface settles at 271.34 K. ② Convection is the largest loss in every case; at 269.15 K it, together with evaporation and droplet warming, can absorb only enough latent heat to freeze about half the water (\(n\) = 0.50). ③ At 271.15 K the air takes away only about half as much heat as at 269.15 K, so only about a quarter freezes. Impact kinetic energy (about 1.7 W/m²) and new-ice cooling are too small to see; recovery heating is the thin orange cap.</figcaption>
+      </figure>
+
+      <p>Three things stand out. First, the dominant gain is always latent heat and the dominant loss is convection: icing is mostly a contest between those two. Second, evaporation is large: about a third (578 of 1776 W/m²) of the losses at 269.15 K, even though the air is saturated (relative humidity 1). The reason is that the wet surface sits at 0 °C, warmer than the air, so its saturation vapour density is higher. Third, the colder the air, the more heat each kilogram of droplets must absorb just to reach 0 °C (431 W/m² at 263.15 K, 172 W/m² at 269.15 K): cold droplets help freezing.</p>
+
+      <h2 id="branches">Rime, glaze and dry panels <span class="level intermediate">Intermediate</span></h2>
+      <p>The balance has one equation but two unknowns: how much ice forms, and what the surface temperature is. Physics supplies the missing condition. A wet surface in this model is held at the melting point; a surface below the melting point must be dry. So there are three cases, and the solver picks one per panel per substep.</p>
+      <ol class="steps">
+        <li><strong>Glaze (wet) branch.</strong> Set \(T_s = T_m\). Then the energy balance gives the ice mass directly: the <em>freeze demand</em> \(M_\text{ice} = (Q_\text{conv} + Q_\text{sub} + M_\text{ev}L_v - E_\text{sources})/L_f\). If that is no more than the available water, accept it. The unfrozen rest is film at \(T_m\), handed to runback.</li>
+        <li><strong>Rime (dry) branch.</strong> If the demand exceeds the water, all of it freezes and the surface must be colder than \(T_m\) (otherwise there would be heat left over). Now the ice mass is known and the unknown is \(T_s\). The solver finds it with a bracketed root solve (<code>scipy.optimize.brentq</code>) of the full balance, including the sensible cooling of the new ice and the temperature dependence of evaporation.</li>
+        <li><strong>Dry panel.</strong> A panel with no water at all has no phase change. Its temperature follows directly from convection and substrate exchange: \(T = (h\,T_\text{rec} + G\,T_\text{sub})/(h + G)\), where \(G\) is the substrate conductance (<code>accrete()</code>, branch <code>available == 0</code>). This may exceed \(T_m\) when recovery heating is strong.</li>
+      </ol>
+      <p>Two more outcomes are errors, by design. If the freeze demand is negative (the panel would need to <em>melt</em> or warm the film), the cold closure raises "Warm film or melting required; outside cold equilibrium closure". A dry panel that already carries ice and would warm above \(T_m\) also raises ("Dry existing ice would melt; requires a melting model"; PHYSICS_REVIEW.md, entry of 2026-11-05). The solver refuses rather than invent physics it does not have.</p>
+
+      <div class="callout why"><div class="callout-title">Why the solver tries glaze first</div>
+        <p>Evaluating the wet branch costs one function evaluation at \(T_m\), and its answer immediately tells whether the dry branch is needed (demand larger than water). The dry root solve only runs when it must. The bracket goes from 30 K below the colder of air and droplet (or substrate) temperature up to \(T_m\); if the balance has the same sign at both ends the code raises "Dry branch temperature is not bracketed" instead of guessing.</p></div>
+
+      <p>There is also a strict <code>mode='rime'</code> in <code>accrete()</code>. It does <em>not</em> force water to freeze. It only checks that the energy balance froze everything and raises "Rime assumption violated" if any liquid remains (MODELS.md: "It does not force every droplet to freeze when the energy budget is insufficient").</p>
+
+      <h2 id="transition">From rime to glaze <span class="level intermediate">Intermediate</span></h2>
+      <p>Sweeping the air (and droplet) temperature on the same real stagnation panel shows the transition the balance predicts.</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/thermo_transition.png" alt="Freezing fraction and surface temperature versus ambient temperature, and freezing fraction versus liquid water content"></div>
+        <figcaption><b>Figure 3.</b> <code>thermo.phase_cell()</code> on the RG-15 shot-6 stagnation panel, one second, own impingement only. Left: freezing fraction. ① The rime campaign temperature (263.15 K) lies in the dry branch. ② The last dry temperature is −7.9 (265.25 K) °C: above it the wet branch takes over and \(n\) falls steeply. ③ Case 3.2 at −4 °C freezes half its water. Middle: surface temperature. In rime it lies between ambient and 0 °C (heated by latent heat); ④ in glaze it is pinned at exactly 0 °C. Right: at fixed temperature, more liquid water content means less freezing per kilogram, because the heat removal does not grow with the water supply. The curves stop at −0.2 °C (272.95 K): above it recovery heating leaves no freezing demand on this panel and <code>phase_cell()</code> raises "Warm film or melting required", as designed.</figcaption>
+      </figure>
+      <p>The transition temperature is not a material constant. It depends on the heat-transfer coefficient, the water catch and humidity of each panel. Panels further back on the airfoil receive less water per square metre, so they stay rime at temperatures where the stagnation region is already glaze. That is why glaze runs have a wet band around the stagnation region and dry ice further back. Figure 4 shows this on the whole wall, now with runback switched on, and it adds a twist: runback concentrates water where the wall shear converges, which can wet a panel even at rime temperatures.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/thermo_wall.png" alt="Impingement, freezing fraction and surface temperature along the real RG-15 wall for rime and case 3.2 temperatures"></div>
+        <figcaption><b>Figure 4.</b> One second of <code>thermo.accrete()</code> on the real shot-6 wall, with real HTC, impingement, shear, wall pressure and gravity, an adiabatic substrate and a dry start. Blue: 263.15 K; green: 269.15 K. ① At 269.15 K the whole impingement zone, from about −3.6 to +8.8 mm, is wet and held at 0 °C; with runback the freezing fraction there is mostly 0.1 to 0.4, lower than the 0.50 of the isolated stagnation panel, because incoming runback counts in the supply and film is still being stored after one second. ② Where the water runs out the panels switch to the dry branch and cool below 0 °C. ③ Even at 263.15 K a few panels around the stagnation point (about −1.3 to −0.2 mm, and near +1 mm) turn wet: there the wall shear changes sign, runback converges and brings more water than the local cooling can freeze. Elsewhere the rime case is dry, with \(n\) about 0.97 (the rest evaporates). ④ Panels outside the impingement zone hold no water; they sit at the recovery temperature (−3.74 °C and −9.74 °C). Water ledgers close to \(10^{-20}\) kg/m; the 269.15 K run needed 1231 transport substeps for 1 s against 39 for rime, because the film sets the CFL limit. This is the panel (<code>accrete</code>) path with no conduction; the rime campaign itself (nodal path, conducting solid) reported no film at all, and the glaze campaign uses the phase-aware path of <a href="glaze.html">Step 10</a>.</figcaption>
+      </figure>
+
+      <h2 id="code">The phase solve in code <span class="level intermediate">Intermediate</span></h2>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p><code>icing/thermo.py</code> → <code>phase_cell()</code> (one panel, one substep), <code>accrete()</code> (whole wall: transport, then phase on every panel, with ledgers), <code>ThermalEnvironment</code> (ambient conditions), <code>evaporation_flux()</code>, <code>local_recovery_temperature()</code>.</p></div>
+      <p>Here is the whole local solve. It is short, and every line maps onto a term above.</p>
+<pre><code class="language-python">def phase_cell(available, impinged, kinetic, length, dt, htc, env, incoming_film_energy=0.):
+    source = impinged * CW * (env.droplet_temperature - TM) + kinetic + incoming_film_energy
+    def parts(t):
+        evap = min(available, evaporation_flux(t, htc, env) * length * dt)
+        cooling = (htc * (t - env.recovery_temperature)
+                   +env.substrate_conductance*(t-env.substrate_temperature)) * length * dt
+        return evap, cooling
+    evap, cooling = parts(TM)
+    remaining = available - evap
+    freeze_demand = (cooling + evap * LV - source) / LF
+    if freeze_demand &lt; -1e-12:
+        raise ValueError('Warm film or melting required; outside cold equilibrium closure')
+    if freeze_demand &lt;= remaining:
+        ice = max(0., freeze_demand)
+        residual = source + ice * LF - cooling - evap * LV
+        return ice, remaining - ice, evap, TM, residual
+    # All surviving water freezes; solve dry surface temperature and ice sensible heat.
+    def balance(t):
+        ev, q = parts(t)
+        return source + (available - ev) * (LF - CI * (t - TM)) - q - ev * (LV + CVAP * (t - TM))
+    lower = min(env.air_temperature, env.droplet_temperature) - 30
+    ...
+    t = brentq(balance, lower, TM, xtol=1e-10)
+    evap, _ = parts(t)
+    return available - evap, 0., evap, t, balance(t)
+</code></pre>
+      <div class="code-src">icing/thermo.py, phase_cell() (input checks and substrate bracket trimmed)</div>
+      <ul>
+        <li><code>source</code> collects what the water brings: droplet sensible heat (negative), kinetic energy, and optionally the sensible energy of incoming film (zero in the equilibrium path).</li>
+        <li><code>parts(t)</code> gives evaporation and convective-plus-substrate cooling at a trial temperature. Evaporation is capped at the available water.</li>
+        <li>At \(T_m\) the code computes the freeze demand. If it fits in the remaining water, that is the glaze answer, with \(T_s = T_m\).</li>
+        <li>Otherwise <code>balance(t)</code> is the full energy balance with every kilogram of surviving water frozen, and <code>brentq</code> finds the dry surface temperature.</li>
+        <li>The returned residual is the energy error of the local solve (J/m span). <code>accrete()</code> sums it into <code>energy_residual</code>.</li>
+      </ul>
+
+      <h3>Inside <code>accrete()</code>: transport, then phase</h3>
+      <p><code>accrete()</code> advances a whole wall over a time interval. Each pass of its loop first moves the film between panels with an explicit, CFL-limited finite-volume step (the subject of <a href="film.html">Step 6</a>), then calls the local phase solve on every panel:</p>
+<pre><code class="language-python">for i in range(n):
+    available = water[i] + rate[i]*step
+    ...
+    elif available == 0:      # dry panel: closed-form convective/substrate balance
+        temperature[i] = (htc[i]*env.recovery_temperature
+                          +env.substrate_conductance*env.substrate_temperature)/(htc[i]+env.substrate_conductance)
+        if prior_ice[i]+ice[i] &gt; 0 and temperature[i] &gt; TM:
+            raise ValueError('Dry existing ice would melt; requires a melting model')
+        ...
+    else:
+        result = phase_cell(available, rate[i]*step, kinetic[i]*step, length[i], step, htc[i], env)
+    frozen, water[i], evap, temperature[i], error = result
+    if mode == 'rime' and water[i] &gt; 1e-13:
+        raise ValueError('Rime assumption violated: available cooling cannot freeze all water')
+</code></pre>
+      <div class="code-src">icing/thermo.py, accrete() inner loop (simplified; slab, layered-column and film-energy branches omitted)</div>
+      <p>Splitting each substep into "move water, then freeze it" is a first-order operator splitting. Substeps are capped at <code>max_substep</code> = 0.05 s by default and by the film CFL limit. After the loop, <code>accrete()</code> checks the global and per-panel water ledgers, computes the freezing fraction, and also returns <code>static_reference_convection</code> \(h(T_s - T_\infty)\) and <code>recovery_heating</code> \(h(T_\text{rec} - T_\infty)\) separately so they can be audited (<a href="#heat">below</a>).</p>
+
+      <div class="callout limits"><div class="callout-title">Which production path uses which solve</div>
+        <ul>
+          <li><code>thermo.accrete()</code> with <code>phase_cell()</code> is the panel path, used by the original <code>run</code> controller (<code>icing/controller.py</code>) and <code>icing/offline.py</code>.</li>
+          <li>The rime campaigns (<code>run-nodal</code>, <code>run-campaign</code> with the rime model) use the same balance on boundary <em>dual cells</em> coupled to a conducting solid mesh: <code>nodal_phase.NodalBoundary.phase()</code> → <code>solid_phase._phase_with_contact()</code> (<a href="#nodal">below</a>).</li>
+          <li>The glaze campaigns (<code>"ice_model": "glaze"</code>) use the phase-aware column model of <a href="glaze.html">Step 10</a>, which solves enthalpy through film, ice and substrate instead of the equilibrium closure.</li>
+        </ul></div>
+
+      <h2 id="vapor">Vapour exchange <span class="level advanced">Advanced</span></h2>
+      <p>Evaporation uses the heat/mass-transfer (Lewis) analogy with Lewis number one: the mass-transfer conductance is \(g = h/(\rho_\text{air} c_p)\), so the CFD heat-transfer coefficient also sets the vapour flux:</p>
+      $$ \dot m_\text{ev} = \max\!\left(0,\; \frac{h}{\rho_\text{air} c_p}\,\big(\rho_{v,\text{sat}}(T_s) - \rho_{v,\infty}\big)\right), \qquad \rho_v = \frac{p_v}{R_v T},\; R_v = 461.5\ \text{J/(kg K)}. $$
+<pre><code class="language-python">def evaporation_flux(temperature, htc, env):
+    if not env.evaporation:
+        return 0.
+    rho_v = surface_saturation_pressure(temperature) / (461.5 * temperature)
+    rho_inf = env.ambient_vapor_pressure / (461.5 * env.air_temperature)
+    # Heat/mass-transfer analogy, Lewis number=1. No condensation in this model.
+    return np.maximum(0., htc / (env.rho_air * CP_AIR) * (rho_v - rho_inf))
+</code></pre>
+      <div class="code-src">icing/thermo.py, evaporation_flux()</div>
+      <p>Two saturation curves are used. Over liquid water the code uses Buck's formula (<code>saturation_pressure()</code>). Over ice it uses Murphy and Koop (2005), Eq. 7 (<code>saturation_pressure_ice()</code>), valid for 110 &lt; T ≤ 273.16 K. <code>surface_saturation_pressure()</code> picks ice below \(T_m\) and water at or above it, because in these closures a wet surface is exactly at \(T_m\), so a colder surface must be ice. The ambient vapour pressure is the relative humidity times the saturation pressure over the phase the user declares in <code>humidity_reference</code> ("water", the default, or "ice"), evaluated at air temperature (VAPOR_EXCHANGE.md).</p>
+      <figure>
+        <div class="frame"><img src="figures/thermo_vapor.png" alt="Buck and Murphy-Koop saturation vapour pressures and their ratio"></div>
+        <figcaption><b>Figure 5.</b> The two saturation curves used by <code>icing/thermo.py</code>. At −20 °C the liquid curve is 1.22 times the ice curve: PHYSICS_REVIEW.md (2026-11-05) records that using the liquid curve for dry ice overstated the surface vapour pressure by about 22 %, which is why the surface phase now selects the curve.</figcaption>
+      </figure>
+      <p>The energy cost is consistent with the enthalpy reference: vapour leaves with \(L_v + c_v(T_s - T_m)\). On the dry branch the evaporated water is taken from the impinging liquid before it freezes, which is equivalent to freezing then sublimating (\(L_f + L_s - L_f\)); PHYSICS_REVIEW.md notes this explicitly. What the cold path does <em>not</em> do: condensation (the flux is clipped at zero), and sublimation of ice that was already there (a panel with no water removes no vapour). The opt-in frost module (<code>icing.frosting</code>) and the phase-aware glaze path handle signed vapour exchange separately (GLAZE_SWIM.md, "Vapor exchange at the column air face").</p>
+      <div class="callout limits"><div class="callout-title">Where to read more</div>
+        <p>VAPOR_EXCHANGE.md describes both vapour closures. The cold equilibrium closure uses <code>surface_saturation_pressure()</code>, with the ice curve below \(T_m\) since 2026-11-05. The phase-aware glaze path has signed exchange: sublimation, condensation and dry rows.</p></div>
+
+      <h2 id="heat">Recovery heating and the CFD heat-transfer coefficient <span class="level advanced">Advanced</span></h2>
+      <p>The heat-transfer coefficient comes from a separate SU2 solution with an isothermal wall held a few kelvin above the air (<code>wall_temperature</code> 273.15 K in the RG-15 cases). <code>fields.wall_fields()</code> computes \(h = -q_\text{SU2}/(T_\text{wall} - T_\infty)\). The incompressible SU2 energy equation has no viscous heating (HEAT_TRANSFER_CONTRACT.md reviewed the v8.4.0 source), so the icing model adds frictional heating itself, through the recovery temperature:</p>
+      $$ q_\text{net cooling} = h(T_s - T_\infty) - h\,\frac{r U_\infty^2}{2 c_p} = h (T_s - T_\text{rec}). $$
+      <p><code>accrete()</code> reports the two parts separately (<code>static_reference_convection</code>, <code>recovery_heating</code>) so the assumption can be audited. HEAT_TRANSFER_CONTRACT.md quantifies its weight: at the probe wall temperature, net cooling is 13.2 % lower than without recovery heating for the proposed RG-15 glaze probe (0.54 % for the George case).</p>
+      <p>The uniform form uses the free-stream speed everywhere. At a stagnation point the true adiabatic wall temperature is the total temperature, so it is slightly too cold there; on suction peaks it is too warm (PHYSICS_REVIEW.md, 2026-11-05). <code>thermo.local_recovery_temperature()</code> provides a local alternative from the wall pressure of the same CFD solution:</p>
+      $$ T_{aw} = T_0 - (1 - r)\frac{U_e^2}{2 c_p}, \qquad U_e^2 = \frac{2(p_\text{stag} - p)}{\rho}, $$
+      <p>with the edge speed from Bernoulli. The case 3.2 package enables it (<code>"local_recovery": true</code> in <code>campaign_32.json</code>). On shot 6 it ranges from about 269.29 to 269.46 K, against 269.41 K for the uniform form, so at 25 m/s the difference is a fraction of a kelvin. On the nodal path, <code>nodal_recovery_temperature()</code> converts panel values to dual cells with HTC weighting, so that \(\sum h L T_\text{rec}\) is the same on panels and dual cells.</p>
+
+      <h2 id="filmenergy">Film sensible energy <span class="level advanced">Advanced</span></h2>
+      <p>In the default ("equilibrium film") closure every surviving film is reset to \(T_m\) after each substep, so runback water carries no sensible energy. That is a good approximation for cold glaze, but it cannot represent warm water: a heated surface, or water warmed by recovery heating. An optional path carries the film's sensible energy \(E = M c_w (T - T_m)\) through transport and phase change.</p>
+      <ul>
+        <li><strong>Transport.</strong> <code>film_energy.transport_film_energy()</code> moves energy with the same donor mass flux used for water: each face carries mass times the donor's specific energy \(E/M\). A dry cell can hold no energy. Total mass and energy are conserved exactly on a closed wall (MODELS.md, "Film sensible-energy transport building block").</li>
+        <li><strong>Phase.</strong> <code>film_phase.phase_with_film_energy()</code> adds the incoming film energy to the source. If the panel still freezes, the existing cold branches apply and the extra heat simply reduces freezing. If not, a warm-liquid branch solves the film temperature between 273.15 and 313.15 K by <code>brentq</code>.</li>
+        <li><strong>Ledger.</strong> <code>accrete(..., film_sensible_energy=E, initial_ice=M_ice)</code> returns <code>film_energy_budget</code>: initial and final liquid energy, droplet sensible, kinetic, net runback, convection, substrate, evaporation and deposited-ice enthalpy. It raises if this ledger fails, or if closed-wall runback creates energy.</li>
+      </ul>
+      <p>A quick check with the real stagnation panel at 269.15 K, carrying an old film of five seconds' impingement: warming that film by 1 K and 3 K above \(T_m\) reduces the ice formed in one second by exactly \(E/L_f\) (ratio 1.000 in the script output). That is the latent-heat response NODAL_FILM_ENERGY.md describes as the independent check (\(-E/L_f\)).</p>
+<pre><code class="language-python">source = incoming_film_energy+impinged*CW*(env.droplet_temperature-TM)+kinetic
+evap, loss = terms(TM)
+if source &lt;= loss+evap*LV:                 # still freezing: reuse the cold closure
+    ice, film, evap, t, residual = phase_cell(available, impinged, kinetic,
+        length, dt, htc, env, incoming_film_energy=incoming_film_energy)
+    return FilmPhase(ice, film, evap, t, 0., residual)
+if existing_ice &gt; 0:
+    raise ValueError('Warm film over existing ice requires melting/interface heat transfer')
+def balance(t):                            # warm liquid: store M*cw*(T-Tm)
+    ev, cooling = terms(t)
+    return source-cooling-ev*(LV+CVAP*(t-TM))-(available-ev)*CW*(t-TM)
+t = brentq(balance, TM, 313.15, xtol=1e-11)
+</code></pre>
+      <div class="code-src">icing/film_phase.py, phase_with_film_energy() (checks trimmed)</div>
+      <p>The guard is the important part: warm water over existing ice would melt it, and the cold closure has no melting model, so it refuses. COUPLED_FILM_SOLID.md lists the remaining limits: warm film over ice, warm solid beneath ice, melting and complete warm-film dryout are all rejected; "rejecting a state must not be bypassed by discarding its energy".</p>
+
+      <h2 id="nodal">The nodal balance with a conducting solid <span class="level advanced">Advanced</span></h2>
+      <p>The rime campaigns do not use a fixed substrate conductance. The ice and airfoil are a finite-element solid (<a href="solid.html">Step 7</a>), and each wall node exchanges heat with it. The surface balance then lives on <em>boundary dual cells</em>: each wall node owns half of each adjacent edge. <code>nodal_phase.NodalBoundary</code> builds these cells and projects panel impingement and kinetic energy onto them so that every extensive quantity is conserved (<code>project_mass()</code>); HTC is averaged by boundary length.</p>
+      <p>The balance is the same one as in <code>phase_cell()</code>, but for all contact nodes at once, because the conduction couples neighbours. In <code>solid_phase._phase_with_contact()</code>:</p>
+<pre><code class="language-python">def terms(t):
+    ev=np.minimum(water,evaporation_flux(t,h,env)*lengths*dt)
+    conducted=dt*(conductance@(t-base))        # heat into the solid, a matrix
+    cooling=dt*lengths*h*(t-recovery)
+    return ev,conducted,cooling
+...
+def residual(trial):
+    ev,q,cooling=terms(trial)
+    balance=source+(water-ev)*(LF-CI*(trial-TM))-q-cooling-ev*(LV+CVAP*(trial-TM))
+    return np.where(wet,trial-TM,balance/scale)  # wet rows: T = Tm; dry rows: energy balance
+...
+demand=(q+cooling+ev*LV-source)/LF
+next_wet[wet &amp; (demand&gt;remaining+1e-12)]=False  # not enough water: becomes dry
+next_wet[(~wet) &amp; (t&gt;TM+1e-9) &amp; ~dry_contact]=True  # too warm to be dry: becomes wet
+</code></pre>
+      <div class="code-src">icing/solid_phase.py, _phase_with_contact() (simplified)</div>
+      <p>It is an <em>active-set</em> method. Guess which nodes are wet; solve the coupled nonlinear system (Newton, falling back to <code>scipy.optimize.root</code>) with \(T = T_m\) on wet nodes and the energy balance on dry ones; then move nodes whose freeze demand exceeds their water to the dry set, and dry nodes warmer than \(T_m\) to the wet set; repeat until the set stops changing (at most 50 iterations, and a repeated set raises "active set cycled"). The conduction enters through <code>conductance</code>, the response of the solid's backward-Euler heat equation to the surface temperatures, eliminated once per step.</p>
+      <p>The single-panel version of that elimination is in <code>thermal_coupling._phase_response()</code>. It solves the slab twice from the same unchanged initial state, at \(T_m\) and \(T_m - 1\) K, reads off the linear response \(q = G(T_s - T_\text{ref})\), plugs it into the ordinary phase closure as a substrate conductance, and only then advances the solid once at the accepted \(T_s\). The heat flowing into the solid is internal: it cancels in the combined ledger, leaving only solid storage and heat lost through the back face.</p>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p><code>icing/nodal_increment.py</code> → <code>advance_nodal_increment()</code>: "transport then phase (first-order splitting)" on fixed dual cells, with mass and external-energy ledgers. <code>icing/nodal_phase.py</code> → <code>NodalBoundary.phase()</code>, <code>.transport()</code>. <code>icing/solid_phase.py</code> → <code>_phase_with_contact()</code>. <code>icing/thermal_coupling.py</code> → <code>phase_with_substrate()</code>, <code>phase_with_column()</code>. <code>icing/nodal_loads.py</code> → <code>nodal_loads_from_snapshot()</code> (maps CFD and collection onto the current wall). <code>icing/nodal_balance.py</code> → <code>stored_totals()</code>, <code>audit_snapshot_balance()</code>.</p></div>
+      <h3>The exposure-wide ledger</h3>
+      <p>Across restarts and geometry updates, <code>nodal_balance.stored_totals()</code> counts what the state holds, in the same enthalpy reference:</p>
+      $$ E_\text{stored} = \sum_\text{nodes} C_j\,(T_j - T_m) \; - \; L_f\,M_\text{ice} \; + \; E_\text{film}, $$
+      <p>the solid's sensible heat from its current nodal temperatures and heat capacities, minus the latent heat of all ice, plus the film's sensible energy. <code>audit_snapshot_balance()</code> checks that stored mass plus evaporated mass plus runoff equals initial mass plus all incoming water (to \(10^{-10}\) relative), and that the change in stored energy equals the external energy recorded step by step (to \(10^{-8}\)). The RG-15 rime shots report residuals of this kind in <code>ice/summary.json</code>, for example a mass residual of \(-9.5\times10^{-18}\) kg/m and an energy residual of \(4.0\times10^{-8}\) J/m for <code>ms_rg15c</code> shot 1, which also reports <code>film_kg_m = 0</code>: the rime run never kept liquid water.</p>
+      <p>For sharp phase interfaces, <code>interface_heat.recover_interface_heat()</code> recovers the conductive heat rates on each side of a paired ice/water edge from one-sided linear finite-element gradients. Its docstring is explicit that these are not equilibrated fluxes and need spatial convergence before use; it is a building block for the glaze and melting work, not part of the cold balance above.</p>
+
+      <h2 id="limits">Assumptions and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li><strong>Quasi-steady, equilibrium surface.</strong> The control volume stores no heat. Wet film is at exactly \(T_m\) in the default path; there is no supercooled film and no nucleation delay.</li>
+          <li><strong>Cold range only.</strong> <code>ThermalEnvironment.validate()</code> accepts air and droplet temperatures from 223.15 to 273.15 K. Melting, warm film over ice and dry ice above \(T_m\) raise errors.</li>
+          <li><strong>Lewis number one</strong>, no condensation and no sublimation of pre-existing ice on the cold path. PHYSICS_REVIEW.md notes Chilton-Colburn with Le ≈ 0.85 would raise mass transfer by about 11 %.</li>
+          <li><strong>Recovery factor 0.85</strong> is an assumption, not a measured distribution (HEAT_TRANSFER_CONTRACT.md). Laminar and turbulent recovery factors are not distinguished.</li>
+          <li><strong>Heat-transfer coefficient</strong> from a single isothermal-wall CFD probe. Its accuracy on rough ice is a separate, open question (<a href="airflow.html">Step 3</a>).</li>
+          <li><strong>Not modelled</strong> in the cold closure (MODELS.md): radiation, mechanical work and viscous dissipation in the film, splash (except the opt-in correlation), detachment and roughness-dependent heat transfer within this step.</li>
+          <li><strong>Verified, not validated.</strong> The ledgers and analytical tests (for example <code>tests/test_heat_reference.py</code>, the Stefan problem in PHYSICS_REVIEW.md) check the bookkeeping and special solutions. No ice-shape validation of this thermal model against experiment exists yet.</li>
+        </ul></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

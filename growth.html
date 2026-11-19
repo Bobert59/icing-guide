@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Growing the ice surface · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 8 · Growing the ice surface</div>
+      <h1>Growing the ice surface</h1>
+      <p class="lede">The freezing balance tells the solver how many kilograms of ice formed on each part of the wall. This page explains how those kilograms become a new wall shape: a polygon that moves outward, sweeps a layer of new ice cells, and must stay simple, well resolved and mass-conservative while it does so.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#idea">From kilograms to a new wall</a> <span class="level basic">Basic</span></li>
+          <li><a href="#legacy">The simple approach and why it was replaced</a> <span class="level basic">Basic</span></li>
+          <li><a href="#local">Local vertex budgets</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#layer">Each step sweeps a layer of conducting cells</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#facets">Why fixed vertices turn into facets</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#normals">Curvature-consistent normals</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#corners">Convex corners: mitre or round fan</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#pockets">Concave pockets: merging fronts</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#halving">When a step fails: halving</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#conservation">Local and global conservation, density</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#code">Where it lives</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="idea">From kilograms to a new wall <span class="level basic">Basic</span></h2>
+      <p>In two dimensions the wall of the airfoil (clean or already iced) is a closed polygon: an ordered list of points, called <b>vertices</b>, joined by straight segments called <b>panels</b>. Every quantity the solver computes on the wall (collected water, heat transfer, frozen mass) is stored per panel or per vertex. The code class for this polygon is <code>Surface</code> in <code>icing/geometry.py</code>; it keeps the points in counter-clockwise order, so the outward normal of each panel points into the air.</p>
+      <p>After a freezing step the solver knows the mass of new ice on each panel, \(m_i\), in kilograms per metre of span (the calculation is two-dimensional, so everything is "per metre of span"). Turning that into a shape takes three ideas:</p>
+      <ol class="steps">
+        <li><b>Mass to volume.</b> Divide by the ice density \(\rho\): \(V_i = m_i/\rho\). In 2D a "volume per metre of span" is an area, in m². The production default is \(\rho = 917\ \mathrm{kg/m^3}\) (dense ice; <code>ice.density</code> in the case files).</li>
+        <li><b>Volume to thickness.</b> Spread over a panel of length \(L_i\), the new layer is about \(h_i \approx V_i / L_i\) thick.</li>
+        <li><b>Thickness to displacement.</b> Move the panel's vertices outward so that the band between the old and the new panel, the <b>swept cell</b>, has exactly the area \(V_i\).</li>
+      </ol>
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 760 250" role="img" aria-label="A wall panel moving outward sweeps a quadrilateral cell whose area equals the frozen mass divided by density">
+            <defs><marker id="ga" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <text class="d-text" x="20" y="34" font-weight="700">1. frozen mass</text>
+            <text class="d-muted" x="20" y="56">m = 2.0e-6 kg/m on a panel</text>
+            <text class="d-text" x="20" y="104" font-weight="700">2. volume</text>
+            <text class="d-muted" x="20" y="126">V = m / ρ  (ρ = 917 kg/m³)</text>
+            <text class="d-text" x="20" y="174" font-weight="700">3. displacement</text>
+            <text class="d-muted" x="20" y="196">move vertices so the swept</text>
+            <text class="d-muted" x="20" y="214">cell has area V</text>
+            <polygon class="d-accent" points="330,190 640,190 660,110 310,110"/>
+            <line class="d-line" x1="300" y1="190" x2="680" y2="190" style="stroke-width:3"/>
+            <line x1="310" y1="110" x2="660" y2="110" style="stroke:var(--accent);stroke-width:3"/>
+            <circle cx="330" cy="190" r="5" fill="var(--text)"/><circle cx="640" cy="190" r="5" fill="var(--text)"/>
+            <circle cx="310" cy="110" r="5" fill="var(--accent)"/><circle cx="660" cy="110" r="5" fill="var(--accent)"/>
+            <line class="d-arrow" x1="330" y1="186" x2="312" y2="118" marker-end="url(#ga)"/>
+            <line class="d-arrow" x1="640" y1="186" x2="658" y2="118" marker-end="url(#ga)"/>
+            <text class="d-text" x="440" y="157">swept cell, area V</text>
+            <text class="d-muted" x="430" y="215">old panel (length L)</text>
+            <text class="d-muted" x="440" y="98">new panel</text>
+            <text class="d-muted" x="680" y="155">h ≈ V / L</text>
+            <text class="d-muted" x="200" y="240">air above, existing ice or substrate below</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 1.</b> The three steps from a frozen mass to a new wall. Each vertex moves outward; the quadrilateral between the old and the new panel is the swept cell. The swept cells of one growth step together form one new layer of ice.</figcaption>
+      </figure>
+      <p>Repeated over many growth steps, this is how the ice horn of a glaze case builds up. Figure 2 shows the real computed walls of the RG-15 glaze case 3.2 after three shots, together with the measured outline at the end of the experiment. (A "shot" is one CFD solution followed by a period of icing on a frozen flow; see <a href="campaign.html">Running a campaign</a>.)</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/growth_glaze_outlines.png" alt="RG-15 case 3.2 computed ice walls at 630, 830 and 1030 seconds compared with the clean airfoil and the measured outline"></div>
+        <figcaption><b>Figure 2.</b> RG-15 glaze case 3.2: the clean wall (890 vertices), the computed walls at 630 s (shot 4, 996 vertices) and 830 s (shot 5, 1,067 vertices) returned from the cluster run <code>runs/nibi/glz81_32</code>, the 1030 s wall of the offline shot-6 replay with the convex-corner limit described below (<code>runs/diag_tip/c_s6_32</code>, 1,005 vertices), and the measured outline after the full 1200 s exposure (<code>mccs_32.csv</code>, red dashes). Call-out 1: the computed tip at 1030 s, x = −8.10 mm. Call-out 2: the measured forward extent, x = −12.28 mm. The model has not yet reached 1200 s and this comparison is not a validation (see <a href="validation.html">How we know it works</a>). The vertex counts change between shots because the wall is refined and points are merged; that is the subject of this page and the next.</figcaption>
+      </figure>
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>Ice growth is bookkeeping with a ruler. Each panel knows how many kilograms froze on it. Dividing by density gives an area; the wall is pushed out until the strip it sweeps has that area. The hard part is not the arithmetic but keeping the polygon healthy while it grows for thousands of steps: panels stretch, corners sharpen and pockets close.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="legacy">The simple approach and why it was replaced <span class="level basic">Basic</span></h2>
+      <p>The first growth law in the project is <code>Surface.grow()</code> in <code>icing/geometry.py</code>. It is still the reference implementation for the legacy controller. It works in three moves:</p>
+      <ul>
+        <li>average the thickness of the two panels around each vertex: \(t_v = (V_{v-1}+V_v)/(L_{v-1}+L_v)\);</li>
+        <li>move each vertex by \(t_v\) along its <b>bisector normal</b>, the normalised sum of the two adjacent panel normals;</li>
+        <li>multiply all displacements by one scalar \(s\), found by a root solve (Brent's method), so that the total swept area equals the total deposited volume exactly.</li>
+      </ul>
+<pre><code class="language-python">thickness = (mass / rho + np.roll(mass / rho, 1)) / (lengths + np.roll(lengths, 1))
+normal = self.normals + np.roll(self.normals, 1, axis=0)
+displacement = thickness[:, None] * normal / norm[:, None]
+def residual(scale):
+    # swept area evaluated directly, not as a difference of two large polygon areas
+    a = (self.points + scale*displacement) - self.points
+    b = self.edges + np.roll(a, -1, axis=0)
+    return .5*float(np.sum(cross(a, b) + cross(b, self.edges))) - target
+scale = brentq(residual, 0, upper, xtol=1e-13)
+</code></pre>
+      <div class="code-src">icing/geometry.py, Surface.grow() (simplified)</div>
+      <p>The single scale factor makes the <i>total</i> exact, but not the parts. On a curved wall a vertex moving outward sweeps a fan that is larger than thickness × length on the convex side and smaller on the concave side. The global factor then corrects this by taking volume from one place and giving it to another, even to a deposit on the other side of the airfoil. The toy test in Figure 3 (left, middle) shows the effect with two separated deposits of the same thickness on an elliptical wall: the legacy law gives the curved nose 0.95 % too much ice and the flat flank 0.68 % too little (scale factor 0.9916). The local law described next gives both exactly.</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/growth_local_vs_legacy.png" alt="Toy comparison of legacy and local growth, and real per-panel deposited versus swept volume for a George increment"></div>
+        <figcaption><b>Figure 3.</b> Left: a 60-panel toy wall with two separated 60 µm deposits (orange). Middle: swept minus deposited volume for each deposit, with the legacy law (<code>Surface.grow</code>, global scale) and with local vertex budgets (<code>nodal_growth._grow_local_volume</code>); both computed by <code>_build/fig_growth.py</code> with the real functions. Right: real data from a saved George increment (<code>runs/george_local_growth_audit_001/volumes.npz</code>): deposited volume per panel and the volume actually swept by the new wall. The sum is exact, but per panel the swept volume is smeared by vertex lumping; the L1 mismatch is 0.717 % of the deposit.</figcaption>
+      </figure>
+      <p>The right panel of Figure 3 is the measurement that started this: "The saved George increment has 0.71692% swept/deposited volume L1 mismatch due to vertex lumping" (<code>docs/PHYSICS_REVIEW.md</code>). Here the <b>L1 mismatch</b> is the sum over panels of |swept − deposited| divided by the total deposit. It is measured by <code>growth_volume_audit()</code>, which every growth step now reports.</p>
+      <div class="callout why"><div class="callout-title">Why it matters</div>
+        <p>With one density everywhere, moving volume between panels does not change the total mass. With different densities on different panels it would: volume taken from dense ice and given to porous ice changes the kilograms. The code therefore refuses a non-uniform density in <code>Surface.grow()</code> ("Nonuniform density requires locally mass-conservative geometry or explicit material transfer"). Global area agreement does not establish local conservation.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="local">Local vertex budgets <span class="level intermediate">Intermediate</span></h2>
+      <p>The growth kernel used by both the rime (nodal) path and the glaze (phase-column) path is <code>_grow_local_volume()</code> in <code>icing/nodal_growth.py</code>. Instead of one global factor, each vertex gets its own volume <b>budget</b>, half of each adjacent panel's deposit:</p>
+      $$B_v = \tfrac12\,(V_{v-1} + V_v).$$
+      <p>If vertex \(v\) moves a distance \(\ell_v\) along a unit direction \(\mathbf n_v\), its exact contribution to the polygon area is \(\tfrac12\,\ell_v\,\mathbf n_v \times \mathbf c_v\), where \(\mathbf c_v\) is the chord from its previous to its next neighbour, taken at mid-motion (the neighbours are moving too). Setting this equal to the budget gives one equation per vertex:</p>
+      $$\ell_v = \frac{B_v}{\tfrac12\,\mathbf n_v \times \mathbf c_v^{\,\text{mid}}}.$$
+      <p>Because \(\mathbf c_v^{\,\text{mid}}\) depends on the neighbours' motion, the code iterates this to a fixed point (at most 50 iterations, converged to \(10^{-13}\) of the displacement):</p>
+<pre><code class="language-python">budget = .5*(volume + np.roll(volume, 1))
+chord = np.roll(points, -1, axis=0) - np.roll(points, 1, axis=0)
+for _ in range(50):
+    mid_chord = chord + .5*(np.roll(move, -1, axis=0) - np.roll(move, 1, axis=0))
+    area_per_length = .5*cross(normals, mid_chord)
+    if np.any(area_per_length &lt;= 0):
+        raise GrowthStepLimit('Local volume growth lost its outward direction')
+    length = spend/area_per_length
+    if np.any(length &gt; max_fraction*scale):
+        raise GrowthStepLimit('Growth exceeds local panel limit; reduce icing time step')
+    updated = length[:, None]*normals
+    converged = np.all(np.linalg.norm(updated - move, axis=1) &lt;= 1e-13*length)
+    move = updated
+    if converged:
+        break
+</code></pre>
+      <div class="code-src">icing/nodal_growth.py, _grow_local_volume() (simplified)</div>
+      <p>Two guards appear in the loop. A vertex may not move further than <code>max_fraction</code> (default 0.25) times the shorter of its two panels; a larger move could fold the wall, so the step is refused with a <code>GrowthStepLimit</code>. And the effective area per unit move must stay positive, otherwise the vertex is no longer moving outward. After the loop the new polygon is checked for self-intersection (<code>Surface.validate_simple()</code>) and every swept quadrilateral for folding; failures again raise <code>GrowthStepLimit</code>, with the offending vertices attached so the glaze path can hold back only the deposit that feeds them (<code>column_ice_growth.promote_basal_column_ice</code>).</p>
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>Each vertex is responsible for half the ice of each of its two panels and must sweep exactly that much area, no more, no less. Nothing is borrowed from distant parts of the wall.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="layer">Each step sweeps a layer of conducting cells <span class="level intermediate">Intermediate</span></h2>
+      <p>In the current solver the ice is not just a line; it is a body with temperature (see <a href="solid.html">Heat inside the ice</a>). So the new layer must be added to the solid finite-element mesh with its mass and energy. For the rime path this is <code>grow_nodal_deposition()</code> in <code>icing/nodal_growth.py</code>:</p>
+      <ol class="steps">
+        <li>Project the nodal deposition (mass and enthalpy) onto panels with the same half-edge weights, so both travel together.</li>
+        <li>Move the wall with <code>_grow_local_volume()</code>.</li>
+        <li>Optionally merge new panels that became too short (see <a href="#pockets">pockets</a>).</li>
+        <li>Allocate the deposit to the swept cells (<code>material_inventory.append_deposited_ice</code>); this checks that every cell is a valid, non-overlapping quadrilateral (or triangle after a merge).</li>
+        <li>Append the cells to the conduction mesh with <code>solid_growth.append_conducting_layer()</code>. Old triangles and old coordinates never move; only new triangles are added.</li>
+        <li>Carry each vertex's film mass to the same vertex of the new wall.</li>
+        <li>Audit: mass, deposited enthalpy and film mass must close to \(10^{-10}\) relative.</li>
+      </ol>
+      <p>At nodes shared between old and new triangles the temperature is mixed so that energy is conserved. With liquid water at the melting point \(T_m\) as reference, <code>docs/CONDUCTING_GROWTH.md</code> writes the update as</p>
+      $$C_\text{new}\,(T_\text{new}-T_m) = C_\text{old}\,(T_\text{old}-T_m) + E_\text{sensible,new},\qquad E_\text{added} = -M_\text{added}\,L_f + E_\text{sensible,new},$$
+      <p>where \(C\) is a lumped nodal heat capacity (J/(m·K)), \(M\) the added mass and \(L_f\) the latent heat of fusion. The code checks this energy balance to \(10^{-8}\) relative and raises an error otherwise. The documentation is explicit that this mixing is "a conservative numerical projection, not a physical heat flux".</p>
+      <p>Figure 4 (left) shows one such layer on the real wall: one 4 s interval of the traced shot-6 replay of glaze case 3.2 at 834 s. The blue strip is the row of swept cells that became solid ice in that step. On the glaze path the same kernel is called when basal ice in the phase columns is <i>promoted</i> to the solid (<code>promote_basal_column_ice</code>; see <a href="glaze.html">Glaze</a>).</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/growth_tip_trace.png" alt="One growth step at the RG-15 3.2 ice tip and the displacement of vertices around the tip over four intervals"></div>
+        <figcaption><b>Figure 4.</b> Real data from the traced replay <code>runs/diag_tip/trace_s6.pkl</code> (glaze case 3.2, shot 6, v8.2 code, mitre corners). Left: the wall before and after one growth step near the most upstream vertex, with the swept cells shaded. Right: how far each vertex moved in each of the first four intervals, by position relative to the tip. The tip moves 61–63 µm per interval, its immediate neighbours 29–44 µm. This is the "spike" discussed under <a href="#corners">convex corners</a>.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="facets">Why fixed vertices turn into facets <span class="level intermediate">Intermediate</span></h2>
+      <p>Suppose the wall keeps the same vertices forever and every vertex moves outward by the same thickness. That is a <b>polygon offset</b>. In an offset, the angle by which the wall turns at each vertex (its <b>turning angle</b>) stays the same, while every panel gets longer in proportion to the local radius of curvature. On a leading edge whose radius grows from about a millimetre to about a centimetre the panels therefore stretch about tenfold, and the wall becomes a set of long straight facets with sharp kinks between them.</p>
+      <figure>
+        <div class="frame"><img src="figures/growth_polygon_offset.png" alt="Toy circle grown from 1 mm to 9 mm radius with fixed vertices and with refinement"></div>
+        <figcaption><b>Figure 5.</b> A 1 mm circle with 24 vertices grown uniformly to 9 mm (400 steps of 20 µm, real <code>_grow_local_volume</code>). Left: fixed vertices; panels grow from 0.26 to 2.36 mm and every vertex still turns 15°. Right: panels longer than 1.5 × target split before each step (<code>wall_resolution.refine_wall</code>); 240 vertices and panels of at most 0.29 mm at the end. Curves every 100 steps.</figcaption>
+      </figure>
+      <p>This is exactly what happened in the RG-15 seven-shot rime campaign of 2026-11 (<code>docs/MESH_ADAPTATION.md</code>): "All shots kept the clean 666 wall vertices", the nose radius grew from under 1 mm to about 9 mm, and "nose panels stretched 17x (0.23 mm to 4.0 mm) into the visible facets". The audit of that campaign:</p>
+      <div class="table-wrap"><table>
+        <tr><th>CFD mesh</th><th>Max nose panel (mm)</th><th>Max turning (°)</th></tr>
+        <tr><td>Shot 1, clean</td><td>1.035</td><td>10.2</td></tr>
+        <tr><td>Shot 3</td><td>1.036</td><td>13.7</td></tr>
+        <tr><td>Shot 5</td><td>1.585</td><td>24.6</td></tr>
+        <tr><td>Shot 6</td><td>2.236</td><td>33.0</td></tr>
+        <tr><td>Shot 7</td><td>3.127</td><td>37.2</td></tr>
+        <tr><td>Final 1200 s wall</td><td>4.026</td><td>75.6</td></tr>
+      </table></div>
+      <p>The remedy is to add vertices during growth: <b>wall refinement</b>, done between shots and explained on the <a href="mesh.html#refine">next page</a>. Refinement inserts points exactly on existing panels, so it cannot restore curvature that was already lost; MESH_ADAPTATION.md therefore says to "apply it from shot 1".</p>
+
+      <!-- ============================================================ -->
+      <h2 id="normals">Curvature-consistent normals <span class="level intermediate">Intermediate</span></h2>
+      <p>The direction in which a vertex moves is a modelling choice. The bisector (sum of the two panel normals) only "sees" the two adjacent panels. The production path can instead use a <b>Gaussian-weighted average</b> of the normals of all panels within a few local panel lengths, weighted by panel length:</p>
+      $$\mathbf n_v \propto \sum_j L_j\,\exp\!\Big(-\tfrac12\big(s_j - s_v\big)^2/w_v^2\Big)\,\mathbf n_j,\qquad |s_j-s_v|\le 3w_v,$$
+      <p>where \(s\) is the arc length along the wall, \(\mathbf n_j\) the normal of panel \(j\) and the width \(w_v\) is <code>normal_smoothing</code> times the mean length of the two panels at \(v\) (default 1.0; 0 restores the bisector).</p>
+<pre><code class="language-python">for i, (si, w) in enumerate(zip(s, width)):
+    distance = (centres - si + .5*perimeter) % perimeter - .5*perimeter
+    near = np.abs(distance) &lt;= 3*w
+    weight = lengths[near]*np.exp(-.5*(distance[near]/w)**2)
+    out[i] = weight@normals[near]
+</code></pre>
+      <div class="code-src">icing/wall_resolution.py, smoothed_vertex_normals() (simplified)</div>
+      <p>The stated purpose (<code>docs/MESH_ADAPTATION.md</code>, pipeline step 1): "Without this, vertices inserted on a facet move parallel to it and stay on the chord forever. With it, they take up the curvature of the corners around them on the next increment." The local volume budget is unchanged; only the direction changes. Where a smoothed direction becomes nearly tangential and folds a swept cell, the kernel retries the same budgets with bisectors at the affected vertices, and then everywhere (<code>_unsmoothed_vertices</code> in <code>_grow_local_volume</code>).</p>
+      <div class="callout limits"><div class="callout-title">What we could and could not confirm</div>
+        <p>In two toy tests made for this guide (refined 24-gon grown to 9 mm, uniform and front-peaked deposition), smoothing did not make the wall measurably rounder: the radius spread was 0.055 mm with smoothing against 0.043 mm without, and the largest turning angle at the front was 33.8° against 30.6°. With uniform growth this is expected: a flat facet advanced by a local volume budget stays flat whatever the direction, because the budget fixes the normal advance. The benefit claimed in the documentation was therefore not reproduced in a toy; it is neither confirmed nor refuted here. Refinement itself made the clear difference (Figure 5).</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="corners">Convex corners: mitre or round fan <span class="level advanced">Advanced</span></h2>
+      <p>The local budget has a hidden assumption at sharp convex corners. A vertex with exterior turning angle \(t\), sweeping half of each adjacent panel's layer of thickness \(h\), moves along its bisector by</p>
+      $$\ell = \frac{h}{\cos(t/2)} \qquad\text{(the mitre offset)},$$
+      <p>and the corner stays exactly as sharp. At \(t = 106^\circ\) that is about \(1.66\,h\). But the model's growth law is growth <i>normal to the ice surface</i>. For that law (Huygens' principle) a convex corner is the centre of an expanding circular fan: it rounds off and advances by only \(h\). The project's physics review of 2026-11-17 (R42 in <code>docs/PHYSICS_REVIEW.md</code>) put it this way: polygon front tracking needs both "entropy" treatments; converging (concave) fronts merge, and diverging (convex) fronts need the fan, "which nothing provided".</p>
+      <p>The evidence came from a traced replay of case 3.2 shot 6 (Figure 4): the tip vertex advanced about 62 µm per 4 s interval, its neighbours 29–44 µm, the flank panels grew from 197/217 µm to 375 µm without any vertex being removed near the tip, and the tip's turning rose from 100° to 105°. The review concluded "The spike is kinematic, not a merge artefact."</p>
+      <p>The correction is the control <code>corner_angle_deg</code> (60° from package v8.3). A convex vertex turning more than this may move at most \(h/\cos(30^\circ) = 1.155\,h\). The part of its budget it cannot sweep is handed to its two neighbours, each receiving the share that came from the panel it shares with the corner (<code>_corner_excess()</code>). That is the round fan, carried on the existing vertices one panel wide. Total volume is exact, and no volume travels further than one panel.</p>
+<pre><code class="language-python">corners = np.degrees(turning_angles(surface)) &gt; float(corner_angle_deg)
+half = .5*(surface.lengths + np.roll(surface.lengths, 1))
+cap = budget/half/np.cos(np.radians(float(corner_angle_deg))/2)   # length limit at each vertex
+...
+# inside the fixed-point loop: re-split the corner budgets from the original ones
+spend, moved = _corner_excess(budget, area_per_length, cap, corners, volume)
+</code></pre>
+      <div class="code-src">icing/nodal_growth.py, _grow_local_volume() and _corner_excess() (simplified)</div>
+      <figure class="wide">
+        <div class="frame"><img src="figures/growth_corner_mitre_fan.png" alt="Toy kite corner grown with mitre and with round-fan limit, and the real RG-15 3.2 tip at 1030 s with both"></div>
+        <figcaption><b>Figure 6.</b> Left and middle: a toy 106° convex corner grown 20 steps with uniform thickness \(h\) per step (real <code>_grow_local_volume</code>; curves every 5 steps). Without the limit the tip advances 1.626 \(h\) per step and keeps its 106° turning; with <code>corner_angle_deg = 60</code> it advances exactly 1.155 \(h\) and relaxes to 84°. Right: the real case 3.2 wall at 1030 s from the v8.2 replay (mitre, call-out 1, <code>runs/preflight_v82/s6_32</code>) and the v8.3 replay (fan, call-out 2, <code>runs/diag_tip/c_s6_32</code>), both started from the returned 830 s wall (light blue). Turning at the tip: 106.2° against 64.1°; the tip is 0.43 mm less advanced; the −124° notch at the base of the lower flank (visible below call-out 1) is gone.</figcaption>
+      </figure>
+      <p>The review records the effect on the returned loads: "3.2 at 1030 s: tip turning 64 degrees instead of 106, tip 0.43 mm less advanced, the -124 degree notch at its base gone (sharpest reflex vertex -75.7 degrees), total ice -0.02 %". Case 3.1 shot 5 was bit-identical, because no convex corner on its horns exceeds 60°.</p>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>60° and 1.155 are a resolution choice (the same feature angle used for exit corners and merge notches), not a calibrated value. The fan is one panel wide, not new vertices on an arc.</li>
+          <li>The measured outline gives the forward extent of the 3.2 ice (12.3 mm) but no tip radius, so whether real tips are sharper or blunter is not known.</li>
+          <li>A directional (droplet-aligned) rime growth law would treat the tip differently again; the model has none. Where collection peaks at the tip, the tip still outruns its flanks, which is physics the correction keeps.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="pockets">Concave pockets: merging fronts <span class="level advanced">Advanced</span></h2>
+      <p>In a concave region the opposite happens. The fronts on both sides converge, panels between them shrink, and the turning sharpens until the wall would fold over itself (the "swallowtail" of a polygon offset). Shrinking panels also shrink the allowed step, because a vertex may move only 0.25 of its shorter panel. Huygens' principle says the overtaken part of the front simply disappears. The solver has two tools for this.</p>
+      <h3>Wall-point merging during growth (rime path)</h3>
+      <p><code>merge_short_panels()</code> in <code>icing/nodal_growth.py</code> merges the two outer vertices of any new panel shorter than <code>merge_ratio</code> (default 0.35) × its target spacing. The merged vertex \(M\) is placed so that the enclosed polygon area is unchanged: with neighbours \(P\), \(Q\) and the pair \(A\), \(B\), it lies on the line \(M \times (Q-P) = P\times A + A\times B + B\times Q\), at the point nearest the midpoint of \(A\) and \(B\). Merges never chain, never touch the closing panel, and each must leave its three neighbouring swept cells positive and convex; otherwise that merge waits. A merged layer records an inner-to-outer vertex map so that cells, film and checkpoints follow it.</p>
+<pre><code class="language-python">P, A, B, Q = points[j-1], points[j], points[j+1], points[j+2]
+c = cross(P, A) + cross(A, B) + cross(B, Q)
+d = Q - P; w = np.array([d[1], -d[0]]); mid = .5*(A + B)
+M = mid + (c - mid@w)/(w@w)*w            # area-preserving, nearest the midpoint
+if not (convex([I[j-1], P, M, I[j]]) and convex([I[j], M, I[j+1]]) and convex([I[j+1], M, Q, I[j+2]])):
+    skipped += 1; continue               # the merge would fold a cell: wait
+</code></pre>
+      <div class="code-src">icing/nodal_growth.py, merge_short_panels() (simplified)</div>
+      <figure class="wide">
+        <div class="frame"><img src="figures/growth_merge_bay.png" alt="A concave bay grown with and without wall point merging and the growth step sizes"></div>
+        <figcaption><b>Figure 7.</b> A toy concave bay (radius 2 mm, panels 0.25 mm) filled by 1.6 mm of uniform growth, with step halving on <code>GrowthStepLimit</code>. Left: without merging the bottom panels shrink to 25 µm and the step has to fall to 5 µm (144 steps). Middle: with <code>merge_ratio = 0.35</code>, 34 vertices are merged, the shortest panel stays 93 µm and the step stays at 20 µm (80 steps). Right: accepted step size against the ice grown. Computed with the real functions by <code>_build/fig_growth.py</code>.</figcaption>
+      </figure>
+      <h3>Pocket fills and crevice sealing (glaze path)</h3>
+      <p>On the glaze path, sub-resolution concave pockets are filled by <code>merge_converging_front()</code> in <code>icing/front_merging.py</code>. Candidates are reflex vertices sharper than <code>notch_angle_deg</code> (60°) or next to panels shorter than <code>merge_ratio</code> × target. The pocket is the smallest wall run (at most <code>max_span</code> = 6 panels) whose closing chord lies in the air and crosses no wall; it is filled only if its area is below <code>area_ratio</code> (0.5) × target² and its own columns hold enough attached ice. The fill takes "the same fraction of every attached basal ice cell of the pocket's rows, at the cell's own specific enthalpy", so mass and energy are conserved exactly, and the run's interior vertices leave the wall. Since 2026-11-16 (R40) two lobes that grow into each other are also closed: when a vertex comes within <code>contact_ratio</code> (0.1) × target of a non-neighbouring panel, the crevice is sealed and the trapped void is represented as porosity in the surrounding ice. The module docstring is explicit that this is "a homogenization of a sub-resolution void, not a model of its content".</p>
+      <p>Both tools change the number of wall vertices inside a shot. The fluid mesh then has to be regenerated at the end of the shot (next page).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="halving">When a step fails: halving <span class="level advanced">Advanced</span></h2>
+      <p>Growth failures are sorted into two kinds by exception class (<code>icing/geometry.py</code>):</p>
+      <ul>
+        <li><b>Reducible</b> failures carry the marker class <code>ReducibleStep</code>: "the same interval with a shorter duration can avoid this failure", and the input state is unchanged. <code>GrowthStepLimit</code> (too large a move, a folded cell, self-intersection) is one; so are thermal non-convergence and film CFL limits.</li>
+        <li><b>Non-reducible</b> failures, such as <code>ConservationError</code> ("Never retry it as a smaller geometric step") and <code>WallRefinementError</code>, stop the run with diagnostics.</li>
+      </ul>
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 760 210" role="img" aria-label="Growth step halving flow">
+            <defs><marker id="gh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <rect class="d-box" x="10" y="70" width="150" height="60" rx="8"/><text class="d-text" x="85" y="96" text-anchor="middle">committed state</text><text class="d-muted" x="85" y="115" text-anchor="middle">duration Δt</text>
+            <rect class="d-accent" x="210" y="70" width="160" height="60" rx="8"/><text class="d-text" x="290" y="96" text-anchor="middle">grow + audit</text><text class="d-muted" x="290" y="115" text-anchor="middle">trial on a copy</text>
+            <rect class="d-ok" x="440" y="10" width="150" height="50" rx="8"/><text class="d-text" x="515" y="40" text-anchor="middle">accept</text>
+            <rect class="d-warm" x="440" y="80" width="300" height="50" rx="8"/><text class="d-text" x="590" y="103" text-anchor="middle">GrowthStepLimit (reducible)</text><text class="d-muted" x="590" y="121" text-anchor="middle">retry from the same state with Δt/2</text>
+            <rect class="d-box" x="440" y="150" width="300" height="50" rx="8"/><text class="d-text" x="590" y="173" text-anchor="middle">conservation / refinement error</text><text class="d-muted" x="590" y="191" text-anchor="middle">stop, write diagnostics</text>
+            <line class="d-arrow" x1="160" y1="100" x2="205" y2="100" marker-end="url(#gh)"/>
+            <line class="d-arrow" x1="370" y1="90" x2="435" y2="40" marker-end="url(#gh)"/>
+            <line class="d-arrow" x1="370" y1="100" x2="435" y2="105" marker-end="url(#gh)"/>
+            <line class="d-arrow" x1="370" y1="112" x2="435" y2="172" marker-end="url(#gh)"/>
+            <path class="d-arrow" d="M 590 80 C 590 60, 300 50, 290 66" marker-end="url(#gh)"/>
+          </svg>
+        </div>
+        <figcaption><b>Figure 8.</b> Step halving. Every trial starts from the last committed state, never from rejected ice. Only reducible geometric or numerical limits are retried with a shorter duration.</figcaption>
+      </figure>
+<pre><code class="language-python">for halving in range(max_growth_halvings+1):
+    trial_duration = duration/(2**halving)
+    # Every trial starts from the committed state, never from rejected ice.
+    # Do not catch thermodynamic, collection or conservation failures here.
+    try:
+        result = advance_snapshot_increment(state, snapshot, wall, duration=trial_duration, ...)
+    except GrowthStepLimit as error:
+        if halving == max_growth_halvings:
+            raise RuntimeError('Conducting-step growth limit exhausted; prior state remains valid') from error
+        continue
+</code></pre>
+      <div class="code-src">icing/nodal_coupling.py, conducting step loop (simplified; default max_growth_halvings = 4)</div>
+      <p>The glaze path does the same per interval in <code>glaze_campaign.py</code> (<code>take = max(floor, take // 2)</code> on a <code>ReducibleStep</code>); when the floor is reached, the exact inputs of the failing interval are saved as <code>failure_interval_NNNNN.pkl</code> so it can be replayed offline. Before halving, the glaze promotion first tries to throttle only the rows feeding the offending vertices (<code>promote_basal_column_ice</code>, the vertices and excess carried by the error).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="conservation">Local and global conservation, density <span class="level advanced">Advanced</span></h2>
+      <p>Three levels of conservation are worth keeping apart:</p>
+      <ul>
+        <li><b>Global:</b> total deposited volume = total swept area. Both laws achieve this to roundoff.</li>
+        <li><b>Per vertex (dual cell):</b> each vertex sweeps exactly its budget. The local kernel achieves this; the corner limit moves budget at most one panel.</li>
+        <li><b>Per panel:</b> each panel's swept cell holds exactly its own deposit. Neither law guarantees this; the swept cells are filled from the panel inventories by <code>append_deposited_ice</code> with an exact allocation, and <code>growth_volume_audit()</code> reports the swept-versus-deposited difference (0.717 % L1 for the saved George increment).</li>
+      </ul>
+      <p>For problems that need exact per-panel budgets, including ice removal, there is <code>move_signed_interface()</code> in <code>icing/signed_interface.py</code>. It solves a bounded least-squares problem for vertex motions along the bisectors so that every panel's signed swept area matches its target, and fails rather than redistribute when the fixed vertex topology cannot achieve it. Its docstring is careful: it "returns candidate boundary geometry ONLY".</p>
+      <h3>Ice density</h3>
+      <p>Production growth uses one uniform density per deposit (917 kg/m³ by default). Variable density is prepared but not in production (<code>docs/VARIABLE_DENSITY_GROWTH.md</code>). Simply removing the uniform-density guard would be wrong, because local smoothing moves volume between neighbouring cells, which could then hold fragments of different density and conductivity. The prepared alternative, <code>material_partition.partition_material_cell()</code>, cuts a convex cell into explicit parallel layers, each occupying exactly its own mass/density volume, and <code>resolved_growth.append_resolved_material</code> inserts them into the thermal mesh. The document states its status plainly: production growth dispatch is pending, and "Density prediction is not provided by this geometric partition".</p>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>Growth is normal to the surface. No directional (droplet-aligned) or feather-growth law is modelled.</li>
+          <li>One density per deposit; porosity appears only through sealed crevices and the sublimation-thinning model, not from a rime density correlation.</li>
+          <li>Temperature mixing at nodes shared by old and new ice is a numerical projection, documented as such.</li>
+          <li>All checks on this page verify numerics (conservation, geometry validity). None of them validates the predicted ice shape against experiment.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="code">Where it lives <span class="level advanced">Advanced</span></h2>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <ul>
+          <li><code>icing/geometry.py</code>: <code>Surface</code> (polygon, normals, <code>validate_simple</code>), legacy <code>Surface.grow</code>, <code>swept_panel_areas</code>, <code>growth_volume_audit</code>, the exception classes (<code>ReducibleStep</code>, <code>GrowthStepLimit</code>, <code>ConservationError</code>).</li>
+          <li><code>icing/nodal_growth.py</code>: <code>_grow_local_volume</code> (local budgets, corner limit), <code>_corner_excess</code>, <code>merge_short_panels</code>, <code>grow_nodal_deposition</code>.</li>
+          <li><code>icing/solid_growth.py</code>: <code>append_conducting_layer</code> (adds the swept cells to the conduction mesh, energy-conserving).</li>
+          <li><code>icing/wall_resolution.py</code>: <code>smoothed_vertex_normals</code>, <code>turning_angles</code>, <code>refine_wall</code>.</li>
+          <li><code>icing/front_merging.py</code>: <code>merge_converging_front</code> (glaze pocket fills and crevice sealing), <code>restrict_wall_fields</code>.</li>
+          <li><code>icing/column_ice_growth.py</code>: <code>promote_basal_column_ice</code> (glaze path calls the same kernel).</li>
+          <li><code>icing/signed_interface.py</code>: <code>move_signed_interface</code> (exact signed per-panel budgets, candidate geometry).</li>
+          <li><code>icing/deformed_wall.py</code>: snaps the CFD wall back to the canonical ice wall after deformation or remeshing (next page).</li>
+          <li>Docs: <code>docs/CONDUCTING_GROWTH.md</code>, <code>docs/MESH_ADAPTATION.md</code>, <code>docs/VARIABLE_DENSITY_GROWTH.md</code>, <code>docs/PHYSICS_REVIEW.md</code> (entries of 2026-11-16 and 2026-11-17, R42).</li>
+        </ul></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

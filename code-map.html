@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Map · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+<style>
+  .map td:first-child { white-space: nowrap; }
+  .map td:nth-child(2) { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; width: 56px; }
+  .map td:last-child { white-space: nowrap; }
+  #filter { width: 100%; font: inherit; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); margin: 6px 0 4px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Section 13 · Reference</div>
+      <h1>Code map</h1>
+      <p class="lede">Every module in the <code>icing</code> package, grouped by the job it does, with its size
+        in lines and the guide page that explains it. Use the filter box to find a module or a word.</p>
+
+      <div class="callout plain"><div class="callout-title">How to use this map</div>
+        <p>Start from an orchestrator (the first table) and follow the calls downward. The groups below follow
+          the order of the <a href="overview.html#loop">icing loop</a>. Line counts are from
+          <code>main</code> on 17 November 2026 (about 21,800 lines in 134 files). Roles come from each
+          module's docstring and public functions.</p></div>
+
+      <input id="filter" type="search" placeholder="Filter modules, e.g. remesh, film, checkpoint…" aria-label="Filter modules">
+
+      <h2 id="orchestration">Entry points and orchestration</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>cli.py</code></td><td>90</td><td>The <code>icing</code> command: <code>run</code>, <code>run-nodal</code>, <code>init-coupled</code>, <code>run-coupled</code>, <code>run-campaign</code>, <code>mesh-check</code>.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>campaign.py</code></td><td>1062</td><td>Multishot campaign driver: shot loop, CFD blocks and gates (<code>CFDPolicy</code>), collection, rime ice stage, adaptation, warm starts, seals, timings, resume.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>glaze_campaign.py</code></td><td>767</td><td>Glaze (phase-aware) model inside the campaign: glaze controls, interval loop, conservation gates, solid maintenance, glaze adaptation, failure capture and replay.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>controller.py</code></td><td>433</td><td>Original coupled controller behind <code>icing run</code>: panel thermodynamics, deformation, Gmsh fallback, water budget, checkpoints.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>nodal_run.py</code></td><td>188</td><td><code>run-nodal</code>: repeated conducting-solid exposure with restart.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>nodal_case.py</code></td><td>190</td><td>Reads and validates a conducting (nodal) case file and its solid archive.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>coupled_case.py</code>, <code>coupled_initial.py</code></td><td>134 / 33</td><td>Prepare a phase-aware case and its clean starting geometry bundle (<code>init-coupled</code>).</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>coupled_exposure.py</code></td><td>180</td><td>Restartable sequence of phase-column exposures and flow refreshes (<code>run-coupled</code>).</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>hpc.py</code></td><td>227</td><td>Batch-scheduler helpers: walltime deadlines, clean stops and resubmission on clusters such as Nibi.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>offline.py</code></td><td>54</td><td>One prescribed thermal increment on a stored collection snapshot (no CFD).</td><td><a href="campaign.html">11</a></td></tr>
+      </table></div>
+
+      <h2 id="air">Airflow (step 3)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>su2.py</code></td><td>576</td><td>Writes SU2 configs (<code>FlowConditions</code>, <code>FlowNumerics</code>), runs SU2_CFD / SU2_DEF, launch retries.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>fields.py</code></td><td>224</td><td>Velocity fields for droplets (VTK cells, uniform, cylinder potential flow) and wall fields: pressure, shear, heat flux, HTC, y+.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>aerodynamics.py</code></td><td>43</td><td>Independent wall-force check: integrates pressure and friction into lift, drag and moment.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>flow_recovery.py</code></td><td>84</td><td>Opt-in reuse of a completed fixed-geometry flow (checked by mesh and solver digests) before a droplet batch resumes.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>su2_warm_start.py</code></td><td>174</td><td>Reads/writes SU2 restarts; maps a converged solution onto a new mesh, wall-relative near the wall.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>roughness.py</code></td><td>470</td><td>Evolving ice roughness, rough-wall heat-transfer correction, roughness-induced transition.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>rough_wall_layer.py</code></td><td>174</td><td>1D SST wall layer that mirrors SU2's smooth and rough wall treatment, used to check it.</td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td><code>result_review.py</code>, <code>exposure_review.py</code></td><td>97 / 123</td><td>Coefficient stability, heat-flux change and reading of past accepted exposure evidence.</td><td><a href="airflow.html">3</a></td></tr>
+      </table></div>
+
+      <h2 id="drops">Droplets and collection (step 4)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>droplets.py</code></td><td>325</td><td>Lagrangian trajectories with Schiller–Naumann drag, size bins, wall impacts, β, optional splash loss (<code>collect()</code>).</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>droplet_execution.py</code></td><td>261</td><td>Parallel execution of seed batches; builds the shared field.</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>droplet_checkpoint.py</code></td><td>71</td><td>Batch store so a long collection can resume.</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>collection_refinement.py</code></td><td>116</td><td>Seed doubling until total and panel-wise capture agree (<code>refined_collect</code>).</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>inlet_quadrature.py</code></td><td>52</td><td>Non-uniform inlet partitions and their refinement.</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>deposition_transfer.py</code></td><td>134</td><td>Conservative accounting for numerical redistribution of newly deposited ice.</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td><code>resolved_deposition.py</code></td><td>170</td><td>Deposits collected water into resolved solid material.</td><td><a href="droplets.html">4</a></td></tr>
+      </table></div>
+
+      <h2 id="heat">Freezing balance and film (steps 5–6)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>thermo.py</code></td><td>486</td><td>Thin-film mass transport and quasi-steady Messinger energy closure (<code>accrete</code>).</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td><code>film_phase.py</code></td><td>67</td><td>Local phase balance that keeps incoming film sensible energy.</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td><code>film_energy.py</code></td><td>52</td><td>Conservative advection of film mass and sensible enthalpy on a closed wall.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>nodal_phase.py</code></td><td>177</td><td>Surface phase balance coupled to the conducting nodal solid (<code>phase_with_nodal_solid</code>).</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td><code>nodal_loads.py</code>, <code>nodal_balance.py</code></td><td>112 / 62</td><td>Wall loads (pressure gradient, rates) for the nodal path; stored totals and balance audits.</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td><code>nodal_coupling.py</code></td><td>366</td><td>One coupled nodal step: runback, phase, solid conduction and growth together.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>nodal_increment.py</code>, <code>nodal_exposure.py</code>, <code>nodal_snapshot.py</code></td><td>114 / 150 / 140</td><td>Fixed-geometry runback/phase increments and exposure loops with inventory ledgers.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>thermal_coupling.py</code>, <code>interface_heat.py</code></td><td>125 / 59</td><td>Implicit coupling of the surface balance to a slab; recovery of interface heat rates.</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td><code>runback_exits.py</code></td><td>62</td><td>Finds runoff exits at sharp convex corners of the clean wall.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>film_air.py</code></td><td>198</td><td>Film inside the air's inner layer: interface shear and aerodynamic stripping.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>film_breakup.py</code></td><td>95</td><td>Film breakup into rivulets with a minimum-total-energy closure.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>film_remap.py</code>, <code>profile_runback.py</code></td><td>84 / 224</td><td>Film transfer between walls; liquid-profile runback transport.</td><td><a href="film.html">6</a></td></tr>
+        <tr><td><code>frosting/</code></td><td>172</td><td>Separate clear-air frost (vapour deposition) model.</td><td><a href="thermo.html">5</a></td></tr>
+      </table></div>
+
+      <h2 id="solid">Heat in the ice (step 7)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>substrate.py</code></td><td>114</td><td>Layered 1D solid heat storage (slabs and columns), backward Euler.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>ice_column.py</code>, <code>column_remap.py</code></td><td>84 / 47</td><td>Planar ice growth by lagged layer addition; conservative depth remap of columns.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>radial_solid.py</code></td><td>69</td><td>Curved (circular-sector) control volumes, an analytical check case.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>solid_fem.py</code></td><td>196</td><td>Linear-triangle 2D conduction with lumped heat capacity.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>solid_phase.py</code></td><td>408</td><td>Cold equilibrium surface phase coupled to the 2D solid response.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>enthalpy_conduction.py</code>, <code>enthalpy_growth.py</code></td><td>308 / 52</td><td>Ice/water enthalpy (phase-change) conduction; appending enthalpy layers.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>element_phase.py</code></td><td>62</td><td>Conservative split of each element into ice and water.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>nodal_initial.py</code>, <code>nodal_checkpoint.py</code></td><td>113 / 184</td><td>Build the clean substrate state; save/load conducting checkpoints.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>material_inventory.py</code>, <code>cut_inventory.py</code>, <code>resolved_inventory.py</code>, <code>resolved_state.py</code></td><td>153 / 89 / 29 / 121</td><td>Persistent geometry and material inventories of deposited ice (layered, cut, resolved).</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>material_partition.py</code>, <code>material_profile.py</code>, <code>nodal_material_projection.py</code></td><td>58 / 35 / 50</td><td>Split cells by material; sample properties at vertices; project material to panels.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>solid_remap.py</code>, <code>solid_maintenance.py</code>, <code>nodal_remesh.py</code></td><td>208 / 126 / 69</td><td>Remesh/coarsen the solid with conservative temperature transfer; keep the solid when the fluid is remeshed.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>thermal_state.py</code>, <code>thermal_inventory.py</code>, <code>thermal_execution.py</code></td><td>196 / 77 / 77</td><td>Fixed-surface thermal restart, thermal inventories, threaded execution records.</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td><code>stefan_interface.py</code></td><td>96</td><td>Sharp ice/water interface mass and latent-energy balance at the melting point.</td><td><a href="solid.html">7</a></td></tr>
+      </table></div>
+
+      <h2 id="geom">Growth and geometry (step 8)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>geometry.py</code></td><td>307</td><td>Wall <code>Surface</code>, normals, area-conserving growth, and the step-limit and conservation error types.</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td><code>nodal_growth.py</code></td><td>313</td><td>Conducting growth: deposition to vertex displacement, short-panel merging (<code>grow_nodal_deposition</code>).</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td><code>solid_growth.py</code>, <code>solid_geometry.py</code></td><td>128 / 157</td><td>Append a conducting layer; validated convex swept cells between old and new wall.</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td><code>deformed_wall.py</code>, <code>signed_interface.py</code>, <code>solid_surface.py</code></td><td>47 / 52 / 84</td><td>Wall-motion helpers: deformed wall, signed interface motion, wall-to-solid mapping.</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td><code>front_merging.py</code></td><td>712</td><td>Merges converging ice fronts in concave pockets (glaze path).</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td><code>resolved_growth.py</code></td><td>132</td><td>Append resolved material at the growing wall.</td><td><a href="growth.html">8</a></td></tr>
+      </table></div>
+
+      <h2 id="mesh">Meshes and adaptation (step 9)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>mesh.py</code></td><td>194</td><td>SU2 mesh reader/writer; signed-area, Jacobian and topology checks (<code>Mesh.require_valid</code>).</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>wall_resolution.py</code></td><td>231</td><td>Target wall spacing from the clean wall, curvature and grading.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>wall_refinement.py</code></td><td>610</td><td>Exact wall splitting with conservative solid cavity re-triangulation and film transfer.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>coupled_wall_refinement.py</code></td><td>152</td><td>Wall refinement of a glaze thermal history.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>mesh_adaptation.py</code></td><td>154</td><td>Deform-or-remesh decision after growth (<code>update_fluid_mesh</code>).</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>fluid_remesh.py</code></td><td>527</td><td>Unstructured fluid remesh: explicit wall layers plus Gmsh core, outer boundary kept.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>wall_layers.py</code></td><td>59</td><td>Polygon-preserving wall layers with collision-limited thickness.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>remesh.py</code></td><td>149</td><td>Older exact-boundary Gmsh remesh with conservative panel transfer (controller fallback).</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>mesh_corner_repair.py</code></td><td>98</td><td>Moves interior vertices near failing cell corners, then re-audits the whole mesh.</td><td><a href="mesh.html">9</a></td></tr>
+        <tr><td><code>ice_mesh_quality.py</code>, <code>coupled_solid_remesh.py</code></td><td>361 / 240</td><td>Keep promoted glaze ice well shaped by conservative local re-triangulation.</td><td><a href="glaze.html">10</a></td></tr>
+      </table></div>
+
+      <h2 id="glaze">Glaze: phase-aware columns, melting and recession (advanced)</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>phase_columns.py</code></td><td>402</td><td>Conservative phase-aware film columns with explicit retained ice and liquid.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>coupled_phase_columns.py</code>, <code>coupled_column_checkpoint.py</code></td><td>343 / 270</td><td>Columns coupled to the solid; the coupled thermal history and its save/load.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>phase_column_runback.py</code>, <code>phase_column_remap.py</code>, <code>phase_column_checkpoint.py</code></td><td>138 / 204 / 29</td><td>Runback between columns (with rivulet fraction), column remap and basal melt insertion, persistence.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>column_ice_growth.py</code></td><td>175</td><td>Promotes basal column ice into the solid (<code>promote_basal_column_ice</code>).</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>collected_coupled_melt.py</code>, <code>collected_phase.py</code></td><td>206 / 55</td><td>One glaze interval with collected loads (<code>glaze_interval</code>).</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>phase_step.py</code>, <code>phase_flow.py</code>, <code>phase_mesh.py</code></td><td>124 / 143 / 90</td><td>Wet-contact classification and phase step; flow refresh and mesh step on the phase path.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>liquid_columns.py</code>, <code>liquid_deposition.py</code>, <code>liquid_freezing.py</code>, <code>liquid_checkpoint.py</code></td><td>63 / 56 / 67 / 64</td><td>Liquid columns: deposition, freezing and checkpoints.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>freezing_step.py</code>, <code>melting_step.py</code>, <code>contact_interface.py</code></td><td>76 / 76 / 63</td><td>Freezing and melting steps; simultaneous solid/column contact.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>melt_topology.py</code>, <code>melted_geometry.py</code>, <code>melt_surface.py</code>, <code>melt_release_map.py</code></td><td>55 / 80 / 75 / 75</td><td>Classify melt, remove exposed melt, rebuild the melt surface, map released melt to columns.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>coupled_melt_mesh.py</code>, <code>coupled_melt_flow.py</code>, <code>coupled_melt_remap.py</code></td><td>218 / 21 / 50</td><td>Fluid/thermal geometry bundle after melting; flow refresh; remap of the melted history.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>phase_cut.py</code>, <code>phase_cut_connectivity.py</code></td><td>93 / 76</td><td>Straight-interface reconstruction in triangles and its surface connectivity.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>sublimation_recession.py</code>, <code>thermal_recession.py</code>, <code>heat_recession.py</code></td><td>171 / 97 / 132</td><td>Wall recession by sublimation or by heat.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>recession_balance.py</code>, <code>recession_energy.py</code>, <code>recession_mesh.py</code>, <code>material_recession.py</code></td><td>126 / 83 / 103 / 124</td><td>Mass/energy budgets of recession, rebuilt meshes and clipped inventories.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>film_thermal_freezing.py</code>, <code>film_thermal_recession.py</code></td><td>98 / 85</td><td>Film-to-solid freezing and recession with thermal history.</td><td><a href="glaze.html">10</a></td></tr>
+        <tr><td><code>phase_checkpoint.py</code>, <code>resolved_checkpoint.py</code></td><td>96 / 67</td><td>Restartable phase-change and resolved-material histories.</td><td><a href="glaze.html">10</a></td></tr>
+      </table></div>
+
+      <h2 id="infra">Integrity and validation helpers</h2>
+      <div class="table-wrap"><table class="map">
+        <tr><th>Module</th><th>Lines</th><th>Role</th><th>Page</th></tr>
+        <tr><td><code>integrity.py</code></td><td>110</td><td>Hashes, atomic writes, "write new only", model-source fingerprints used by checkpoints and seals.</td><td><a href="campaign.html">11</a></td></tr>
+        <tr><td><code>validation.py</code></td><td>206</td><td>Shape, curve and collection metrics; the inlet capture audit.</td><td><a href="validation.html">12</a></td></tr>
+      </table></div>
+
+      <h2 id="outside">Outside the package</h2>
+      <ul>
+        <li><code>tests/</code>: the unit-test suite (run with <code>python -m unittest discover -s tests</code>).</li>
+        <li><code>tools/</code>: about 90 scripts that verify a model against an analytical case
+          (<code>verify_*</code>), compare with data (<code>compare_*</code>), prepare user-run packages
+          (<code>prepare_*</code>) or replay a saved state (<code>replay_*</code>).</li>
+        <li><code>hpc/nibi/</code>: install, preflight and self-resubmitting job scripts for the Nibi cluster.</li>
+        <li><code>docs/</code>: model descriptions, the physics review log and run returns.
+          <code>docs/MODELS.md</code> and <code>docs/PHYSICS_REVIEW.md</code> are the best next reads after this guide.</li>
+      </ul>
+    </article>
+  </main>
+</div>
+<script>
+  document.getElementById('filter').addEventListener('input', e => {
+    const q = e.target.value.trim().toLowerCase();
+    document.querySelectorAll('table.map tr').forEach((tr, i) => {
+      if (!tr.querySelector('td')) return;
+      tr.style.display = !q || tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  });
+</script>
+</body>
+</html>

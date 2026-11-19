@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How we know it works · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 12 · How we know it works</div>
+      <h1>How we know it works (and what we do not know yet)</h1>
+      <p class="lede">A solver can be correct as a program and still be wrong about ice. This page separates
+        the two questions, shows the evidence the project has for each, and states plainly where it stands
+        today: the numerics are well verified in many places, and no physical validation of predicted ice
+        shapes has been achieved yet.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#vv">Verification is not validation</a> <span class="level basic">Basic</span></li>
+          <li><a href="#tests">The unit-test suite</a> <span class="level basic">Basic</span></li>
+          <li><a href="#exact">Checks against exact solutions</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#droplets">Droplet collection against theory and experiment</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#george">Sensitivity studies on George-2</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#rg15">The RG-15 ice-shape benchmark</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#plans">Prospective test plans</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#status">What is still open</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="vv">Verification is not validation <span class="level basic">Basic</span></h2>
+      <p>Two different questions hide behind "does it work?".</p>
+      <ul>
+        <li><b>Verification</b>: does the program solve the equations it claims to solve, correctly and with a
+          known numerical error? You answer this with mathematics: exact solutions, refinement studies,
+          conservation checks, independent re-implementations.</li>
+        <li><b>Validation</b>: are those equations the right description of real icing? You can only answer
+          this with measurements: ice shapes, collection efficiencies, heat transfer measured in a tunnel,
+          each with a known measurement uncertainty.</li>
+      </ul>
+      <p>A model can pass every verification test and still predict the wrong ice, because a physical effect
+        is missing or a closure is wrong. The project's physics review says this in so many words:
+        "Conservation tests, numerical convergence and agreement with experiments are different requirements.
+        Passing one does not establish the others. No overall physical-validation claim is supported yet."
+        (<code>docs/PHYSICS_REVIEW.md</code>, introduction).</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 820 470" role="img" aria-label="Ladder of evidence from runs-without-crashing up to validated prediction, with the rungs the project has reached marked">
+          <g>
+            <rect x="40" y="398" width="520" height="50" rx="8" class="d-ok"/>
+            <text x="60" y="428" class="d-text">1  It runs end to end (integration)</text>
+            <rect x="80" y="340" width="520" height="50" rx="8" class="d-ok"/>
+            <text x="100" y="370" class="d-text">2  It conserves mass and energy (audits, gates)</text>
+            <rect x="120" y="282" width="520" height="50" rx="8" class="d-ok"/>
+            <text x="140" y="312" class="d-text">3  It matches exact solutions (Stefan, film, flux)</text>
+            <rect x="160" y="224" width="520" height="50" rx="8" class="d-ok"/>
+            <text x="180" y="254" class="d-text">4  Numerical error is measured (refinement, sensitivity)</text>
+            <rect x="200" y="166" width="520" height="50" rx="8" class="d-accent"/>
+            <text x="220" y="196" class="d-text">5  Compared with published theory (NACA 1215)</text>
+            <rect x="240" y="108" width="520" height="50" rx="8" class="d-warm"/>
+            <text x="260" y="138" class="d-text">6  Compared with experiment (NASA cylinder, RG-15)</text>
+            <rect x="280" y="50" width="520" height="50" rx="8" class="d-box" stroke-dasharray="6 4"/>
+            <text x="300" y="80" class="d-text">7  Agrees within quantified uncertainty: VALIDATED</text>
+          </g>
+          <text x="40" y="30" class="d-text" font-weight="700">Verification (rungs 1-4)  →  Validation (rungs 6-7)</text>
+          <g class="d-muted" font-size="12.5">
+            <text x="600" y="428">reached</text>
+            <text x="640" y="370">reached</text>
+            <text x="680" y="312">reached</text>
+            <text x="720" y="254">reached</text>
+          </g>
+          <text x="560" y="466" class="d-muted">Solid: reached. Dashed: not reached.</text>
+          <text x="40" y="466" class="d-muted">Rungs 5-6: done, with unexplained gaps (see text).</text>
+        </svg></div>
+        <figcaption><b>Figure 1.</b> A ladder of evidence. The lower four rungs are verification; they are
+          necessary but say nothing about real ice. Rung 5 compares with other people's calculations, rung 6
+          with measurements. Only rung 7, agreement within a quantified measurement and model uncertainty,
+          would be validation. The project has many results on rungs 1-4, comparisons with open discrepancies
+          on rungs 5-6, and nothing on rung 7.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>Verification asks "did we build the thing right?"; validation asks "did we build the right thing?".
+          This project has a lot of evidence for the first and, so far, only open comparisons for the second.
+          The documents are careful never to mix them: every result file carries flags like
+          <code>"physical_validation": false</code> or <code>"experimental_validation_pass": false</code>.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="tests">The unit-test suite <span class="level basic">Basic</span></h2>
+      <p>The first line of defence is a suite of fast automated tests in <code>tests/</code>. They do not run
+        SU2 or any long computation; they check small pieces against hand-computable answers. The README
+        gives the command, run from the project root:</p>
+<pre><code class="language-bash">python -m unittest discover -s tests -v</code></pre>
+      <div class="code-src">README.md, "Fresh checkout"</div>
+      <p>GitHub Actions runs the same suite on Windows and Linux with Python 3.11 and 3.12 (README). The suite was not
+        run for this guide; the counts below come from reading the files.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_tests.png" alt="Horizontal bar chart of test functions per subsystem"></div>
+        <figcaption><b>Figure 2.</b> Composition of the suite: 227 test files (<code>tests/test_*.py</code>) with
+          1,007 functions named <code>test_...</code>, grouped by subsystem from their file names. The grouping
+          is a keyword rule in <code>_build/fig_validation.py</code> (<code>CATEGORIES</code>), so a file that
+          touches two subsystems is counted once. The largest groups are orchestration and restart (236) and
+          ice growth and geometry (232): the parts with the most bookkeeping. Count from 2026-11-17; the
+          suite grows almost daily (the 2026-10-17 audit in <code>docs/VALIDATION.md</code> counted 127).</figcaption>
+      </figure>
+
+      <p>The tests check things like: local and global water conservation, analytic phase-change limits,
+        restart equivalence (stop and resume gives the same bits), refusal of a changed sealed file, correct
+        unit conversion of SU2 wall fields, exact conservation of a front-merging fill
+        (<code>test_front_merging</code>), and the corner-growth rule (<code>test_corner_growth</code>, seven
+        tests). Many tests encode a past failure: for example
+        <code>test_a_collinear_wall_vertex_is_never_filled_into_a_flat_element</code> reproduces the defect
+        that stopped the case 3.2 run (<code>docs/GLAZE_ROBUSTNESS.md</code>, R41).</p>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul><li>A passing suite shows that each piece does what its author intended. It cannot show that the
+          intention is physically right, and it does not exercise the full coupled campaign at production
+          scale; that is what pilots and packages are for (<a href="campaign.html">Step 11</a>).</li></ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="exact">Checks against exact solutions <span class="level intermediate">Intermediate</span></h2>
+      <p>The strongest verification uses a problem whose exact answer is known in closed form. Three are
+        shown in Figure 3.</p>
+
+      <h3>Stefan freezing: ice growing on a cold wall</h3>
+      <p>Liquid water at the melting point \(T_m\) sits on a wall held at \(T_\text{cold}\) = 263.15 K. Ice
+        grows from the wall; the heat of fusion released at the ice-water interface must be conducted through
+        the ice into the wall. With no airflow, evaporation or liquid heating, this one-dimensional problem
+        (the one-phase Stefan problem) has an exact similarity solution: the thickness grows like the square
+        root of time,</p>
+      $$ s(t) = 2\lambda\sqrt{\alpha t}, \qquad \lambda\, e^{\lambda^2}\operatorname{erf}\lambda = \frac{c_i\,(T_m - T_\text{cold})}{L_f\sqrt{\pi}}, $$
+      <p>where \(\alpha = k/(\rho c_i)\) is the thermal diffusivity of ice (k = 2.2 W/m/K, ρ = 917 kg/m³),
+        \(c_i\) its specific heat and \(L_f\) the latent heat. The right-hand side is the Stefan number
+        divided by \(\sqrt\pi\); here St = 0.0629 and λ = 0.17557. The tool solves this with the production
+        ice-column code and compares the thickness after 2 s.</p>
+<pre><code class="language-python">rho, k, cold = 917., 2.2, 263.15
+alpha = k/(rho*CI)
+stefan = CI*(TM-cold)/LF
+lam = brentq(lambda x: x*np.exp(x*x)*erf(x) - stefan/np.sqrt(np.pi), .00001, 1.)
+initial_time, duration = 1., 2.
+thickness = lambda t: 2*lam*np.sqrt(alpha*t)
+...
+for cells, steps in ((16, 40), (32, 80), (64, 160)):   # refine depth and time together
+    ...</code></pre>
+      <div class="code-src">tools/verify_stefan_growth.py, verify() (simplified)</div>
+      <p>Starting at t = 1 s (the exact solution has zero thickness at t = 0, which no grid can hold) avoids
+        the singularity; the initial temperature is integrated to cell averages so the start is exact. Halving
+        the cell size and the time step together halves the error: 0.2703 %, 0.1348 %, 0.06733 %, which is
+        first-order convergence, as expected from the scheme. The mass residual is below 1.1 × 10⁻¹⁵ kg/m² and
+        the global energy residual below 2 × 10⁻¹⁰ J/m² at every level
+        (<code>runs/stefan_growth_verification_001/report.json</code>).</p>
+
+      <h3>Film transport: water pushed along by air shear</h3>
+      <p>With constant shear τ and no phase change, the thin-film equation reduces to a scalar conservation
+        law, \( h_t + \left(\tau h^2/(2\mu)\right)_s = 0 \), whose exact solution follows characteristics until
+        a shock forms at about 0.597 s. <code>tools/verify_film.py</code> compares the finite-volume cell
+        averages on a circle at 0.1 s: the L1 error falls from 0.719 % at 40 panels to 0.0896 % at 320, an
+        observed order of 1.000; mass error at most 8.7 × 10⁻¹⁹ kg/m
+        (<code>runs/film_refinement_001/refinement.json</code>).</p>
+
+      <h3>Droplet seeding: how many seeds are enough</h3>
+      <p>On a 16-panel polygon in a uniform stream the exact droplet flux on each panel is a projected
+        area. The production refinement loop doubles the seeds until the panel distribution changes by less
+        than 1 % twice in a row. It stopped at 4,096 seeds; the error against the exact flux was then 0.187 %
+        (panel L1) with a total-capture difference of -8.4 × 10⁻⁵
+        (<code>runs/seed_refinement_analytic_001/verification.json</code>).</p>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_refinement.png" alt="Three log-log refinement plots: Stefan thickness error, film L1 error and droplet seed refinement"></div>
+        <figcaption><b>Figure 3.</b> Refinement studies with exact answers. <b>(1)</b> Stefan freezing: error
+          halves with each joint halving of cell size and step: first order. <b>(2)</b> Film transport:
+          observed order 1.000 against the characteristic solution. <b>(3)</b> Seed refinement: blue is the
+          true error against the exact projected flux; orange is what the solver can see, the change from the
+          previous level. The rule stops when orange is below 1 % twice (circled). Orange is a reasonable but
+          not perfect proxy for blue: at 2,048 seeds it reads 0.59 % while the true error is 0.21 %.
+          Script <code>_build/fig_validation.py</code>.</figcaption>
+      </figure>
+
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>The Stefan problem is planar pure-ice freezing with liquid exactly at T<sub>m</sub>. It checks
+            conduction, latent heat and the moving boundary; the report itself says "not airfoil experimental
+            validation".</li>
+          <li>The film test has no freezing and constant shear; the seed test has no flow deflection. Each
+            checks one operator in isolation.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="droplets">Droplet collection against theory and experiment <span class="level intermediate">Intermediate</span></h2>
+      <p>Droplet collection is the one part of the chain that can be compared with experiment in isolation,
+        because collection on a cylinder has been measured with dye-tracer methods and computed in classic
+        NACA reports.</p>
+
+      <h3>Theory: NACA Report 1215</h3>
+      <p>NACA Report 1215 tabulates total collection efficiency E of cylinders as a function of the inertia
+        parameter K and the parameter φ. The solver's trajectories (potential flow, Schiller-Naumann drag)
+        reproduce K = 1 within 0.9 %, but fall 6.5 % short at K = 4 and 2.3 % at K = 16
+        (<code>docs/VALIDATION.md</code>, "Cylinder theoretical comparison"). An independent integrator
+        (DOP853, exact circle, separately written drag) agrees with the production code to 8.1 × 10⁻⁶, so the
+        gap is not a polygon or time-step error. Replacing the drag law by the historical sphere-drag table
+        (NACA TN 1397) the report cites does not close it either: E = 0.565 at K = 4, against 0.616 in the
+        report. The tabulated-drag values lie close to the older Langmuir column printed in the same table at K = 4
+        and 16; the project notes that this agreement "does not validate the NACA comparison".</p>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_naca1215.png" alt="Grouped bars of collection efficiency at K 1, 4 and 16 for NACA 1215, Langmuir, the solver and the solver with tabulated drag"></div>
+        <figcaption><b>Figure 4.</b> Theory against theory at φ = 1000. Percentages are solver minus NACA 1215,
+          relative. <b>(1)</b> The 6.5 % K = 4 deficit survives every numerical check and the drag-table
+          change. The project records it as unresolved and assigns no pass
+          (<code>runs/naca1215_tabulated_drag_001/study.json</code>; data
+          <code>data/naca1215_langmuir_comparison.csv</code>).</figcaption>
+      </figure>
+
+      <h3>Experiment: NASA CR-4257 cylinder</h3>
+      <p>NASA CR-4257 Figure 6.6(a) gives a measured local collection efficiency β around a 0.1016 m cylinder
+        at 80.25 m/s with a 20.4 µm median volumetric diameter, represented by seven mass-weighted bins. The
+        targeted package (<code>docs/CYLINDER_TARGETED_RETURN.md</code>) refined seeds locally, globally and
+        in trajectory step over five stages up to 156,440 seeds. Every predeclared numerical gate passed
+        (mixture changes below 1 %, every bin below 2 %; the largest change was 0.06 %). The comparison with
+        the measured curve is what remains:</p>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_cylinder.png" alt="Measured and computed local collection efficiency around a cylinder"></div>
+        <figcaption><b>Figure 5.</b> Computed β (stage 5) against the digitized measurement. Total E = 0.3588,
+          RMSE 0.048, largest pointwise difference 0.126 (<code>runs/cylinder_targeted_return_001/report.json</code>).
+          <b>(1)</b> The measured peak sits off the stagnation line and the curve is asymmetric.
+          <b>(2)</b> The model is symmetric by construction. <b>(3)</b> The biggest gap is on the left flank.
+          The comparison uses incompressible potential flow at Mach 0.24 (the original report used
+          compressible flow), no boundary layer, and no recovered measurement uncertainty; digitization bounds
+          are not measurement uncertainty. Hence <code>"experimental_validation_pass": false</code>.</figcaption>
+      </figure>
+      <div class="callout why"><div class="callout-title">Why no pass is declared</div>
+        <p>A pass needs a criterion, and a fair criterion needs the measurement uncertainty. Without it any
+          threshold would be chosen after seeing the result. The project's rule
+          (<code>docs/PHYSICS_REVIEW.md</code>, "Working rules") is to record failed comparisons and never
+          choose corrections "solely to reduce benchmark error".</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="george">Sensitivity studies on George-2 <span class="level intermediate">Intermediate</span></h2>
+      <p>George-2 is a 0.30 m airfoil test case used for early rime runs. Its studies do not compare with
+        experiment; they measure how much a result moves when a numerical or modelling choice moves. Three are
+        worth knowing.</p>
+      <ul>
+        <li><b>Upstream inlet.</b> The original droplet inlet at x = -0.8 m was too narrow and lost captures
+          outside its lower edge. Widening it at the same seed spacing recovered 3,732 impacts, 41.09 % of the
+          corrected captured mass. Against the x = -0.4 m baseline the panel mass and impact-energy
+          distributions then differ by 0.848 % and 0.851 % (L1)
+          (<code>runs/george_upstream_wide_return_001/INTERPRETATION.md</code>). Lesson: check that no
+          droplet hits the wall from the edge of the seeding band. The campaign collection stage applies such
+          a check on every shot (<code>validation.inlet_capture_audit</code> in <code>campaign.run_collection</code>).</li>
+        <li><b>Heat-transfer coefficient (HTC) screen.</b> Scaling the HTC of a saved George snapshot by 0.25 to
+          2 over 0.1 s of exposure (Figure 6).</li>
+        <li><b>Heat-reference audit.</b> The CFD gives a wall heat flux; the icing balance uses
+          \(h\,(T_s - T_\text{rec})\) with a recovery temperature. Reconstructing the flux with the recovery
+          reference changes it by -0.54 % for George and by -13.2 % for a hypothetical RG-15 glaze probe at the
+          melting point (<code>runs/heat_reference_audit_001/report.json</code>). After reviewing SU2's energy
+          equation, the project keeps h and adds recovery heating explicitly
+          (<code>docs/HEAT_TRANSFER_CONTRACT.md</code>); the uniform recovery assumption itself is unvalidated.</li>
+      </ul>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_george_htc.png" alt="Local ice change and maximum surface temperature change against HTC multiplier"></div>
+        <figcaption><b>Figure 6.</b> George-2 HTC screen (<code>runs/george_htc_sensitivity_001/report.json</code>).
+          <b>(1)</b> Even at a quarter of the HTC the local ice changes by only 0.44 %, because <b>(2)</b> the
+          surface simply warms (by up to 12.7 K) while still freezing all the water: no film is retained in
+          any scenario. In this cold, supply-limited regime the ice mass cannot tell a good thermal closure from
+          a bad one. A partially freezing (glaze) experiment is needed to test it
+          (<code>docs/PHYSICS_REVIEW.md</code>, "Priorities").</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="rg15">The RG-15 ice-shape benchmark <span class="level advanced">Advanced</span></h2>
+      <p>The independent target the project has chosen is the second AIAA Ice Prediction Workshop (IPW-2)
+        case set on the RG-15 airfoil: 0.30 m chord, 25 m/s, 4° incidence, 0.52 g/m³, 1,200 s, at three
+        temperatures: 3.1 glaze (-2 °C), 3.2 mixed (-4 °C) and 3.3 rime (-10 °C)
+        (<code>data/rg15_ipw2/conditions.json</code>). The measured outlines are "maximum combined
+        cross-sections" (MCCS): the outermost extent of the ice over several spanwise sections, not a mean
+        section (<code>data/rg15_ipw2/README.md</code>). The conditions file itself is marked
+        <code>"ready_for_validation": false</code> and lists five unresolved items, the first being coordinate
+        registration.</p>
+
+      <h3>Predicted outlines, shot by shot</h3>
+      <figure>
+        <div class="frame"><img src="figures/validation_outlines_glaze.png" alt="Leading-edge zoom of predicted ice outlines after each shot and the measured outline for cases 3.1 and 3.2"></div>
+        <figcaption><b>Figure 7.</b> Leading-edge zoom, tunnel frame, millimetres. Grey: clean airfoil; blue,
+          light to dark: the iced wall after each shot (<code>shot_NN/ice/surface.csv</code> of runs glz81_31
+          and glz81_32); red dashed: measured MCCS v3 at 1,200 s (<code>mccs_31.csv</code>,
+          <code>mccs_32.csv</code>). <b>(1)</b> Case 3.1 at 1,200 s: the most upstream point is at -5.35 mm.
+          <b>(2)</b> Case 3.2's last completed shot is at 830 s, not 1,200 s, so its outline must not be read
+          as the final prediction. <b>(3)</b> The measured 3.2 ice reaches -12.3 mm. <b>(4)</b> The measured
+          3.1 outline has a large upper horn that the prediction does not form.</figcaption>
+      </figure>
+      <figure>
+        <div class="frame"><img src="figures/validation_outline_rime.png" alt="Leading-edge zoom of predicted rime ice outlines per shot and the measured outline for case 3.3"></div>
+        <figcaption><b>Figure 8.</b> The same view for the rime case (run <code>ms_rg15c</code>, shots 1-6 to
+          1,030 s; measured outline <code>data/rg15_ipw2/processed/rime_open_x35mm.csv</code>).
+          <b>(1)</b> The predicted ice at 1,030 s reaches -8.3 mm. <b>(2)</b> The measured 1,200 s outline
+          reaches -13.4 mm. Shot 7 (1,030-1,200 s) was never run, so 170 s of growth is missing from the
+          prediction.</figcaption>
+      </figure>
+
+      <p>Only case 3.1 has a predicted outline at the measured exposure time. Using the package's own frozen
+        metric code (<code>compare()</code> in the package's <code>run.py</code>, upstream of x = 35 mm) on
+        that outline gives, descriptively: symmetric RMS distance 3.40 mm, 95th percentile 6.13 mm, forward
+        extent 5.35 mm against 9.35 mm measured, and ice area 122.7 mm² against 351.1 mm² measured. The
+        measured references reproduce those written into the package plan (3.1: area 351 mm², forward extent
+        9.4 mm), which checks the computation. <b>These numbers were computed for this guide; they are not a
+        returned result, and no verdict is attached.</b> The run did not complete (its final adaptation
+        failed), so the plan's predeclared shape hypothesis H2 does not apply, and the registration question
+        below is unresolved.</p>
+
+      <h3>The registration caveat</h3>
+      <p>To compare a predicted outline with a measured one you must know where the measured outline sits
+        relative to the airfoil: its units, origin and angle. The CSV files carry no such metadata. The project
+        reads them as millimetres from the source paper's figure axes and applies no shift or rotation
+        (<code>data/rg15_ipw2/processed/preparation.json</code>). A consistency check then fails:</p>
+
+      <figure>
+        <div class="frame"><img src="figures/validation_registration.png" alt="Vertical clearance of measured ice above and below the clean airfoil in two frames, showing negative values in both"></div>
+        <figcaption><b>Figure 9.</b> Vertical clearance of the measured ice surface from the clean airfoil,
+          15-35 mm behind the leading edge (solid: upper surface; dashed: lower). Negative means the measured
+          "ice" lies inside the airfoil, which is impossible. <b>(a)</b> In the nominal airfoil frame used by the
+          registration audit, all three upper surfaces penetrate: -0.438 mm (rime), -0.353 mm (mixed),
+          -0.215 mm (glaze), which reproduces <code>docs/RG15_REGISTRATION_AUDIT.md</code> to the printed
+          digits (<b>1</b>). <b>(b)</b> In the 4° tunnel frame that the glaze and rime campaign packages use
+          (the airfoil rotated by -4°, <code>tools/prepare_rg15_glaze_package.py</code>), the upper surfaces
+          clear the wall, but the lower surfaces now penetrate, by up to 1.07 mm for glaze (<b>2</b>).
+          Panel (b) is an extra check computed for this guide, not part of the recorded audit.</figcaption>
+      </figure>
+
+      <p>Neither frame makes the measured outlines consistent with the clean airfoil, so the registration is
+        genuinely unknown, not just unrecorded. The audit also found that the experimental files were revised
+        between v2 and v3 in a way that is not a rigid shift, and that a newer dataset uses a different clean
+        contour that would remove most of the rime overlap. Its conclusion: "registration and geometry
+        definition remain unresolved; do not infer a unique whole-outline shift or calibrate against CFD".</p>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>Near the leading edge a 4° rotation about the origin moves a point 12 mm away by about 0.8 mm
+            (12 mm × sin 4°); a translation offset is not excluded either. Until registration is settled, any
+            sub-millimetre agreement or disagreement means nothing, and even millimetre-scale differences have
+            no stated uncertainty.</li>
+          <li>The MCCS is an envelope over span; a 2-D prediction is one section. The envelope is larger by
+            construction.</li>
+          <li>Ice mass is almost the same in all three cases (<a href="campaign.html#timeline">Step 11</a>,
+            Figure 3), so the differences that matter are in shape and in where the water freezes.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="plans">Prospective test plans <span class="level advanced">Advanced</span></h2>
+      <p>Every expensive run is planned before it starts. <code>VALIDATION_RUN_PLAN.txt</code> at the project
+        root lists the user-run tests in execution order, and each frozen package carries its own
+        <code>EXPERIMENT_PLAN.txt</code> whose hash is in the package manifest. A plan entry must state the
+        scientific question, the hypothesis, what is held fixed and what is varied, the measurable outcomes,
+        numerical criteria <em>written down before the run</em> with their rationale, how pass, fail and
+        inconclusive will be read, the runtime, the files to return, the prerequisites and the stopping rules
+        (<code>AGENTS.md</code>). Criteria are never invented after a result is seen.</p>
+      <p>Here is the real entry for the next rime run, ms_rg15d (trimmed):</p>
+<pre><code class="language-text">READY 2026-11-17 — RG-15 case 3.3 rime campaign, version d (ms_rg15d)
+QUESTION AND COMPARISON
+Can the solid cavity fix carry the RG-15 rime campaign through the shot-6
+adaptation at 1,030 s, start shot 7 from a conforming fluid/solid pair, and
+complete all seven shots to 1,200 s with the existing numerical gates?
+CONTROLS AND VARIATION
+- Every solver input and the runner are byte-identical to the c package
+  rg15_multishot_nibi_20261114. Code revision is the varied factor.
+HYPOTHESES AND MEASURES
+- H1, completion: all seven shots seal, results/summary.json ends at 1,200 s, ...
+- H2, targeted regression: shot_06/adapt seals, the solid boundary covers
+  every refined panel, and the maximum eligible wall-panel length after
+  refinement divided by target is &lt;= 2.5 (the configured hard limit). ...
+- M2: minimum scaled Jacobian &gt;= 0.10 ...
+- H4, descriptive: cumulative ice remains within 3% of ms_rg15 at 30, 230,
+  430 and 630 s (0.00489443, 0.0371816, 0.069175 and 0.100779 kg/m). ...
+INTERPRETATION
+- Pass if H1, H2 and M1-M3 pass. H0/H4 deviations trigger review of the
+  returned loads, collection and adaptation records, without changing gates.
+- A node, filesystem or allocation failure, repeated MPI launch fault or
+  exhausted walltime chain without a numerical fault is inconclusive.
+STOP AND RETURN
+- Stop on a failed pilot, a FAILED or STOPPED marker, a numerical gate
+  failure, or a shot past 300,000 iterations without CFD acceptance.</code></pre>
+      <div class="code-src">VALIDATION_RUN_PLAN.txt, entry "READY 2026-11-17 — RG-15 case 3.3 rime campaign, version d"</div>
+      <p>Notice what this plan tests: completion and a specific code fix, not agreement with the
+        experiment. That is honest about what the run can decide. The glaze package plans add a shape
+        question (Q2) with screening bands, and say explicitly that "the outlines carry no quantified
+        registration or measurement uncertainty, so these screening bands are not a validation acceptance".
+        The v8.1 return shows the discipline at work: hypothesis H6 failed "as written" in both cases, was
+        diagnosed as a poorly chosen criterion, and was restated for the <em>next</em> package only; "The v8.1
+        verdict is unchanged" (<code>docs/PHYSICS_REVIEW.md</code>, 2026-11-16).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="status">What is still open <span class="level advanced">Advanced</span></h2>
+      <p>The physics review keeps a priority table of governing-model gaps. Shortened from
+        <code>docs/PHYSICS_REVIEW.md</code>, "Priorities and evidence required":</p>
+      <div class="table-wrap"><table>
+        <tr><th>Priority</th><th>Issue</th><th>What is still required</th></tr>
+        <tr><td>1</td><td>Thermal phase closure</td><td>Glaze path has film enthalpy, crusts, melting and
+          refreezing, vapour exchange and runoff outlets; still missing for a full claim: partial-cell fronts,
+          rough-ice HTC, dry-ice sublimation, detachment physics and independent glaze validation.</td></tr>
+        <tr><td>1</td><td>Heat-transfer uncertainty</td><td>HTC sensitivity to mesh, wall temperature,
+          transition and roughness; an independent thermal benchmark; no tuning of HTC to ice shapes.</td></tr>
+        <tr><td>1</td><td>Droplet-model discrepancies</td><td>Resolve or quantify disagreement with independent
+          impingement data (Figures 4 and 5). Seed convergence cannot remove drag-law or flow-model error.</td></tr>
+        <tr><td>1</td><td>Layered solid geometry</td><td>Preserve substrate volume and ice mass and enthalpy as the
+          surface moves; verify curved geometry and remesh transfer.</td></tr>
+        <tr><td>2</td><td>Surface mass exchange</td><td>Dry CFD-visible ice has no vapour exchange; the
+          Lewis-one analogy is unvalidated here.</td></tr>
+        <tr><td>2</td><td>Film flow limits</td><td>Thin-film assumptions; rivulets; a predictive detachment
+          force balance (exits are prescribed or placed at sharp corners).</td></tr>
+        <tr><td>2</td><td>Ice material</td><td>Density, conductivity and roughness are prescribed constants, not
+          predictions.</td></tr>
+        <tr><td>3</td><td>Droplet extensions</td><td>Splash, breakup and large drops; the opt-in LEWICE mass-loss
+          correlation is unvalidated here.</td></tr>
+      </table></div>
+
+      <p>And the benchmark status, in one table:</p>
+      <div class="table-wrap"><table>
+        <tr><th>Evidence</th><th>Kind</th><th>Status</th></tr>
+        <tr><td>Stefan, film, seed flux</td><td>exact solutions</td><td>verified, first order as designed</td></tr>
+        <tr><td>Cylinder seed/step refinement</td><td>numerical uncertainty</td><td>all predeclared gates passed</td></tr>
+        <tr><td>NACA 1215</td><td>theory</td><td>-6.5 % at K = 4, unexplained</td></tr>
+        <tr><td>NASA CR-4257 cylinder</td><td>experiment</td><td>RMSE 0.048, asymmetric data, no uncertainty: no pass</td></tr>
+        <tr><td>George-2 studies</td><td>sensitivity</td><td>bounded; cold case cannot discriminate thermal closures</td></tr>
+        <tr><td>RG-15 3.1 / 3.2 / 3.3</td><td>experiment</td><td>no run completed; registration unresolved; no comparison verdict</td></tr>
+      </table></div>
+
+      <div class="callout plain"><div class="callout-title">In plain words: where we stand</div>
+        <p>The numerical building blocks are tested against exact answers and converge as they should;
+          mass and energy are conserved to round-off; campaigns are reproducible and auditable. What is not yet
+          shown is that the predicted ice looks like real ice. The first full RG-15 campaigns stopped on
+          defects that have since been fixed (and the fixes checked offline), the measured outlines cannot yet
+          be placed reliably on the airfoil, and the predicted glaze outlines that exist are visibly smaller
+          than the measured envelopes. The project therefore makes <b>no physical-validation claim</b>, and
+          this guide does not either.</p></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

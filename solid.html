@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heat inside the ice · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 7 · One icing cycle</div>
+      <h1>Heat inside the ice</h1>
+      <p class="lede">The freezing balance of Step 5 needs to know how much heat the wall can take away. That heat flows by conduction into the ice already there and into the wing skin below it. This page follows how the solver models that conduction, from a single fixed number to a 2D triangle mesh with melting and freezing inside it, and how it checks the result against an exact solution.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#why">Why conduction changes the ice</a> <span class="level basic">Basic</span></li>
+          <li><a href="#ladder">Four models, one ladder</a> <span class="level basic">Basic</span></li>
+          <li><a href="#slab">Rungs 1 and 2: a fixed conductance and 1D slabs</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#column">Rung 3: a column that grows</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#fem">Rung 4: the 2D conducting solid</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#coupling">How the surface balance talks to the solid</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#layers">Growth layers: the swept-cell inventory</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#enthalpy">Enthalpy: melting and freezing inside the solid</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#remesh">Remeshing the solid without losing heat</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#stefan">Checking against an exact answer: the Stefan problem</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="why">Why conduction changes the ice <span class="level basic">Basic</span></h2>
+      <p>When a supercooled droplet freezes, it releases latent heat: 333.7 kJ for every kilogram (<code>LF</code> in <code>icing/thermo.py</code>). That heat has to go somewhere, or the water cannot freeze. On the <a href="thermo.html">freezing energy balance</a> page the main sink was the cold air: convection carries heat away at a rate \( h\,(T_s - T_{rec}) \), where \( h \) is the heat-transfer coefficient from the CFD, \( T_s \) the surface temperature and \( T_{rec} \) the recovery temperature of the air.</p>
+      <p>But there is a second sink. Under the surface sits the ice that has already formed and, under that, the wing skin. If they are colder than the surface, heat flows into them. Every joule that goes into the wall is a joule the air does not have to remove, so more water can freeze. The solver writes this directly in its phase closure. In <code>thermo.phase_cell</code> the "cooling" term contains both the air and the wall, and the freezing demand is computed from it:</p>
+<pre><code class="language-python">def parts(t):
+    evap = min(available, evaporation_flux(t, htc, env) * length * dt)
+    cooling = (htc * (t - env.recovery_temperature)
+               +env.substrate_conductance*(t-env.substrate_temperature)) * length * dt
+    return evap, cooling
+evap, cooling = parts(TM)
+remaining = available - evap
+freeze_demand = (cooling + evap * LV - source) / LF
+</code></pre>
+      <div class="code-src">icing/thermo.py, phase_cell() (excerpt)</div>
+      <p>In words: at the melting point, add up the heat the air takes (convection), the heat the wall takes (substrate term) and the heat evaporation takes; subtract the heat the droplets bring; divide by the latent heat. That is how many kilograms <em>can</em> freeze. If the demand is smaller than the water available, the rest stays liquid (glaze). If it is larger, all the water freezes and the surface cools below 0&nbsp;°C (rime).</p>
+
+      <figure>
+        <div class="frame"><img src="figures/solid_freezing_fraction.png" alt="Freezing fraction rising with substrate conductance for two air temperatures"></div>
+        <figcaption><b>Figure 1.</b> The same <code>thermo.phase_cell</code> called with toy inputs: 25&nbsp;m/s, LWC 0.52&nbsp;g/m³, collection efficiency 0.6, \( h = 250 \) W/(m²K), wall reservoir at air temperature. Only the substrate conductance \( G \) changes. <b>1</b>: at −4&nbsp;°C with an insulated wall (\( G=0 \)), 62&nbsp;% of the water freezes. <b>2</b>: near \( G \approx 230 \) W/(m²K) all water that does not evaporate freezes and the surface leaves 0&nbsp;°C: the panel has switched from glaze to rime only because the wall is colder. <b>3</b>: at −2&nbsp;°C the effect is the same in kind: 30&nbsp;% freezes on an insulated wall, 76&nbsp;% at \( G=600 \). Toy numbers, not a run; script <code>_build/fig_solid.py</code>.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>Ice is a heat sponge with a limited appetite. A cold wing skin soaks up some of the latent heat of freezing, so more water freezes and the ice shape changes. But the sponge fills: as the ice and skin warm up, they take less. To get this right the solver must follow the temperature <em>inside</em> the solid over time, not just at the surface.</p></div>
+
+      <p>That last point is the reason for everything that follows. A fixed conductance with a fixed wall temperature (the toy in Figure 1) never warms up, so it overstates the effect at long times. A real wall stores heat and warms. Its own ice layer grows thicker, which adds resistance. And for glaze, the solid can be at 0&nbsp;°C with water inside it. Each rung of the model ladder below adds one of these effects.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="ladder">Four models, one ladder <span class="level basic">Basic</span></h2>
+      <p>The code still contains every stage of this development. They are not alternatives you pick at random: each one was built, checked, and then used as a building block of the next.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 330" role="img" aria-label="Ladder of solid models from fixed conductance to 2D enthalpy solid">
+          <defs>
+            <marker id="sl-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          </defs>
+          <!-- rung 1 -->
+          <rect x="10" y="40" width="175" height="210" rx="8" class="d-box"/>
+          <text x="97" y="64" text-anchor="middle" class="d-text" font-weight="700">1 · fixed conductance</text>
+          <rect x="40" y="120" width="115" height="10" class="d-accent"/>
+          <line x1="97" y1="130" x2="97" y2="175" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3"/>
+          <rect x="40" y="175" width="115" height="22" fill="#d9d4cb" stroke="var(--muted)"/>
+          <text x="97" y="191" text-anchor="middle" class="d-muted">reservoir T_wall</text>
+          <text x="105" y="157" class="d-muted">G</text>
+          <text x="97" y="225" text-anchor="middle" class="d-muted">thermo.phase_cell</text>
+          <text x="97" y="241" text-anchor="middle" class="d-muted">no heat storage</text>
+          <!-- rung 2/3 -->
+          <rect x="205" y="40" width="175" height="210" rx="8" class="d-box"/>
+          <text x="292" y="64" text-anchor="middle" class="d-text" font-weight="700">2-3 · 1D columns</text>
+          <rect x="250" y="90" width="85" height="14" class="d-accent"/>
+          <rect x="250" y="104" width="85" height="14" class="d-accent"/>
+          <rect x="250" y="118" width="85" height="14" class="d-accent"/>
+          <rect x="250" y="132" width="85" height="16" fill="#d9d4cb" stroke="var(--muted)"/>
+          <rect x="250" y="148" width="85" height="16" fill="#d9d4cb" stroke="var(--muted)"/>
+          <rect x="250" y="164" width="85" height="16" fill="#d9d4cb" stroke="var(--muted)"/>
+          <text x="345" y="112" class="d-muted">ice</text>
+          <text x="345" y="160" class="d-muted">skin</text>
+          <text x="292" y="207" text-anchor="middle" class="d-muted">substrate.advance_column</text>
+          <text x="292" y="225" text-anchor="middle" class="d-muted">ice_column.grow_column</text>
+          <text x="292" y="241" text-anchor="middle" class="d-muted">depth only, per panel</text>
+          <!-- rung 4 -->
+          <rect x="400" y="40" width="185" height="210" rx="8" class="d-box"/>
+          <text x="492" y="64" text-anchor="middle" class="d-text" font-weight="700">4 · 2D conducting solid</text>
+          <path d="M430,180 Q450,90 540,95 L560,180 Z" fill="#d9d4cb" stroke="var(--muted)"/>
+          <path d="M430,180 Q450,90 540,95 L545,82 Q440,72 418,180 Z" class="d-accent"/>
+          <path d="M445,175 L470,120 L500,170 Z M470,120 L520,110 L500,170 M520,110 L545,175 L500,170" fill="none" stroke="var(--muted)" stroke-width="0.8"/>
+          <text x="492" y="207" text-anchor="middle" class="d-muted">solid_fem.SolidFEM</text>
+          <text x="492" y="225" text-anchor="middle" class="d-muted">nodal path: run-nodal (rime)</text>
+          <text x="492" y="241" text-anchor="middle" class="d-muted">ice + PLA, sideways heat flow</text>
+          <!-- rung 5 -->
+          <rect x="605" y="40" width="185" height="210" rx="8" class="d-warm"/>
+          <text x="697" y="64" text-anchor="middle" class="d-text" font-weight="700">5 · 2D enthalpy solid</text>
+          <path d="M635,180 Q655,90 745,95 L765,180 Z" fill="#d9d4cb" stroke="var(--muted)"/>
+          <path d="M635,180 Q655,90 745,95 L750,82 Q645,72 623,180 Z" class="d-accent"/>
+          <path d="M624,170 Q640,90 750,80" stroke="var(--ok)" stroke-width="5" fill="none" opacity="0.7"/>
+          <text x="697" y="207" text-anchor="middle" class="d-muted">enthalpy_conduction</text>
+          <text x="697" y="225" text-anchor="middle" class="d-muted">glaze path: run-coupled</text>
+          <text x="697" y="241" text-anchor="middle" class="d-muted">ice, water and 0 °C mush</text>
+          <line x1="187" y1="290" x2="790" y2="290" class="d-arrow" marker-end="url(#sl-a)"/>
+          <text x="20" y="295" class="d-muted">more physics:</text>
+          <text x="210" y="315" class="d-muted">heat storage</text>
+          <text x="330" y="315" class="d-muted">growing ice resistance</text>
+          <text x="500" y="315" class="d-muted">sideways conduction</text>
+          <text x="650" y="315" class="d-muted">phase change inside</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 2.</b> The ladder of solid models in the code. Rungs 2 and 3 are drawn together because the growing column (rung 3) is the fixed column of rung 2 plus new ice cells. The rime production path stops at rung 4; the glaze path uses rung 5 (see <a href="glaze.html">Step 10</a>).</figcaption>
+      </figure>
+
+      <div class="table-wrap"><table>
+        <tr><th>Rung</th><th>Model</th><th>Main code</th><th>What it adds</th><th>Where it is used today</th></tr>
+        <tr><td>1</td><td>Fixed reservoir conductance</td><td><code>ThermalEnvironment.substrate_conductance</code></td><td>Heat to a wall at fixed temperature</td><td>Optional term in the simple controller (<code>icing run</code>); default 0</td></tr>
+        <tr><td>2</td><td>1D slab / layered column</td><td><code>substrate.advance_slab</code>, <code>advance_column</code>, <code>thermal_coupling.phase_with_column</code></td><td>Heat storage and through-thickness conduction</td><td>Python API, verification</td></tr>
+        <tr><td>3</td><td>Growing ice column</td><td><code>ice_column.grow_column</code>, <code>column_remap.remesh_column</code></td><td>New ice cells add resistance and capacity</td><td>Stefan verification (<code>tools/verify_stefan_growth.py</code>)</td></tr>
+        <tr><td>4</td><td>2D conducting solid on triangles</td><td><code>solid_fem.SolidFEM</code>, <code>solid_phase</code>, <code>nodal_*</code></td><td>Real geometry, sideways conduction, ice + substrate materials</td><td>Rime: <code>icing run-nodal</code> and rime campaigns</td></tr>
+        <tr><td>5</td><td>2D enthalpy solid</td><td><code>enthalpy_conduction.advance_enthalpy</code>, <code>element_phase</code>, <code>enthalpy_growth</code></td><td>Melting and refreezing inside the solid</td><td>Glaze: <code>icing run-coupled</code> and glaze campaigns</td></tr>
+      </table></div>
+
+      <!-- ============================================================ -->
+      <h2 id="slab">Rungs 1 and 2: a fixed conductance and 1D slabs <span class="level intermediate">Intermediate</span></h2>
+      <p><strong>Rung 1</strong> is the simplest: a prescribed conductance \( G \) in W/(m²K) to a reservoir at a fixed temperature, so the wall takes \( q = G\,(T_s - T_{wall}) \). <code>docs/MODELS.md</code> is blunt about it: it "represents an explicitly prescribed, quasi-steady thermal resistance; it does not solve substrate temperatures". The default is \( G = 0 \), an insulated wall.</p>
+      <p><strong>Rung 2</strong> gives the wall a memory. <code>substrate.advance_column</code> splits the wall under one panel into depth cells, each with its own width \( \Delta z_i \), conductivity \( k_i \), density and specific heat. The heat equation in one dimension,</p>
+      $$ \rho c\,\frac{\partial T}{\partial t} = \frac{\partial}{\partial z}\left(k\,\frac{\partial T}{\partial z}\right), $$
+      <p>is discretised with finite volumes and the <em>backward Euler</em> method: the conduction fluxes are evaluated at the <em>end</em> of the time step. That makes each step a small linear system, but it never goes unstable however large the step. Two cells exchange heat through a face conductance equal to one over the sum of their half-cell resistances, \( G_{i+1/2} = 1 / \left(\tfrac{\Delta z_i}{2k_i} + \tfrac{\Delta z_{i+1}}{2k_{i+1}}\right) \), which keeps heat flux continuous where ice meets skin.</p>
+<pre><code class="language-python">capacity = rho * cp * dz
+half_resistance = dz/(2*k)
+conductance = 1/(half_resistance[:-1]+half_resistance[1:])
+...
+# Solve for the temperature increment to avoid subtracting large absolute
+# thermal energies when auditing a small heat exchange.
+diagonal = capacity / dt
+internal = conductance * np.diff(old)
+rhs[:-1] += internal
+rhs[1:] -= internal
+...
+delta = solve_banded((1, 1), bands, rhs)
+stored = float(np.dot(capacity, delta))
+return new, float(heat_in), float(heat_out), stored, float(stored - dt * (heat_in - heat_out))
+</code></pre>
+      <div class="code-src">icing/substrate.py, advance_column() and _advance_linear_column() (simplified)</div>
+      <p>Two habits that run through the whole solver appear here first. The unknown is the temperature <em>increment</em>, not the temperature itself, because subtracting two large absolute energies would lose digits. And every step returns an <em>energy residual</em>: stored energy minus net heat in. A step whose ledger does not close is a bug, not a result.</p>
+      <p>How does a surface balance use such a column? <code>thermal_coupling._phase_response</code> uses a neat trick. Because the column is linear, the heat it takes is an affine function of the surface temperature, \( q = G\,(T_s - T_{ref}) \). The code finds \( G \) and \( T_{ref} \) by solving the column twice, at \( T_m \) and at \( T_m - 1 \)&nbsp;K, without advancing it. Then it reuses the rung-1 closure with that <em>effective</em> conductance, and finally advances the column once at the accepted surface temperature:</p>
+<pre><code class="language-python">high = solve(TM)
+low = solve(TM-1.)
+conductance = high.surface_heat_in - low.surface_heat_in
+reference = TM - high.surface_heat_in / conductance
+response_env = replace(env, substrate_conductance=conductance,
+                       substrate_temperature=reference)
+...
+phase = phase_cell(available, impinged, kinetic, length, dt, htc, response_env)
+...
+solid = solve(phase[3])
+</code></pre>
+      <div class="code-src">icing/thermal_coupling.py, _phase_response() (simplified)</div>
+      <p>So rung 2 does not replace rung 1; it <em>computes</em> the conductance that rung 1 needs, from the actual stored heat, for every time step.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="column">Rung 3: a column that grows <span class="level intermediate">Intermediate</span></h2>
+      <p>Ice is itself a conductor (2.2&nbsp;W/(m&nbsp;K) in the RG-15 cases) and a heat store. As it thickens, heat from the surface has further to go. <code>ice_column.grow_column</code> adds the freshly frozen ice as a new cell on top of the column <em>after</em> each conduction step:</p>
+<pre><code class="language-python">phase = phase_with_column(available, impinged, kinetic, length, dt, htc, env,
+    column.widths, column.conductivity, column.density, column.specific_heat,
+    column.temperature, back_temperature, ...)
+thickness = phase.ice/(length*ice_density)
+if thickness &gt; 0:
+    arrays = [np.r_[value, a] for value, a in zip(
+        (thickness, ice_conductivity, ice_density, CI), arrays)]
+    temperature = np.r_[phase.surface_temperature, temperature]
+    flags = np.r_[True, flags]
+</code></pre>
+      <div class="code-src">icing/ice_column.py, grow_column() (simplified)</div>
+      <p>The module docstring states the cost of this simplicity: "New ice is added AFTER conduction through the existing layers in each step. Time refinement is required; this is not a moving-boundary implicit solution." Because every step adds a cell, the column would grow without limit; <code>column_remap.remesh_column</code> re-divides each material layer into a fixed number of equal cells, moving heat by exact overlap integrals, and raises an error if the column enthalpy changes by more than \( 10^{-10} \) of its size.</p>
+      <p>The bookkeeping rule behind this rung is stated in <code>docs/PHYSICS_REVIEW.md</code> ("Governing thermal balance"): using liquid water at \( T_m \) as the zero of energy, ice holds \( -L_f + c_i (T - T_m) \) per kilogram, so <em>external energy in = change of existing solid energy + energy carried by the newly deposited ice</em>. Heat flowing from the surface into the solid is internal and must cancel. <code>grow_column</code> returns exactly this residual.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="fem">Rung 4: the 2D conducting solid <span class="level intermediate">Intermediate</span></h2>
+      <p>A 1D column cannot carry heat sideways. At a leading edge that matters: the stagnation line is wet and warm, the flanks a few millimetres away may be dry and cold, and the ice horns are thicker than the skin. <code>solid_fem.SolidFEM</code> solves 2D heat conduction on a triangle mesh that covers both the wing skin (here the PLA of the RG-15 model, \( k = 0.2 \) W/(m&nbsp;K), \( \rho c = 1.8 \) MJ/(m³K), the "PLA properties" in <code>tools/prepare_rg15_glaze_package.py</code>) and every bit of ice added so far (\( k = 2.2 \), \( \rho c = 917 \times 2100 \)).</p>
+      <p>It uses <em>linear triangles</em>: temperature varies linearly inside each triangle and lives on the corners (nodes). Each triangle's heat capacity is <em>lumped</em> to its three corners in equal thirds. One backward-Euler step solves</p>
+      $$ \left(\frac{M}{\Delta t} + K + R\right)\,\Delta T = P + b - (K + R)\,(T^{old} - T_{ref}), $$
+      <p>where \( M \) is the diagonal (lumped) capacity, \( K \) the conduction matrix, \( R \) and \( b \) an optional convective (Robin) boundary condition, and \( P \) prescribed nodal powers.</p>
+<pre><code class="language-python">local = k[:,None,None]*self.area[:,None,None]*np.einsum('eik,ejk-&gt;eij',gradient,gradient)
+self.stiffness = coo_matrix((local.ravel(),(rows,cols)),shape=(n,n)).tocsr()
+self.element_capacity = c*self.area
+self.capacity = np.bincount(self.triangles.ravel(),
+    weights=np.repeat(self.element_capacity/3,3),minlength=n)
+...
+matrix = diags(self.capacity/dt)+self.stiffness+exchange
+rhs = force+load-exchange@old-self.stiffness@(old-reference)
+delta[free] = spsolve(matrix[free][:,free],rhs[free]-matrix[free][:,fixed]@delta[fixed])
+</code></pre>
+      <div class="code-src">icing/solid_fem.py, SolidFEM.__init__() and step() (simplified)</div>
+      <p>The constructor also refuses bad elements. A triangle whose area is only round-off is rejected outright, with a comment that explains why: such an element "conducts with k*cot(angle) ~ 1e15 W/m/K", and in the returned glaze run <code>glz81_32</code> one such flat triangle made every later solve fail its energy audit (<code>DEGENERATE_SINE</code>, GLAZE_ROBUSTNESS R41). Reading that run's 926&nbsp;s checkpoint with today's <code>SolidFEM</code> indeed stops on "element 28808 ... area 3.31e-24 m2".</p>
+
+      <figure>
+        <div class="frame"><img src="figures/solid_rime_temperature.png" alt="Temperature field in the rime ice and PLA nose at 630 s, and a temperature profile across ice and substrate"></div>
+        <figcaption><b>Figure 3.</b> The conducting solid of the RG-15 rime campaign (−10&nbsp;°C air) at the end of shot 4, 630&nbsp;s (<code>runs/nibi/ms_rg15/snapshot_20261111/.../shot_04/adapt/solid.json</code>: 152,878 nodes, 305,022 triangles). White dashed line: the clean PLA wall; light blue line: the ice surface. <b>1</b>: the warmest node, −5.3&nbsp;°C, on the lower side where most water arrives and freezes: the latent heat warms the ice. <b>2</b>: the PLA interior. The coldest solid is the upper side, −9.9&nbsp;°C, close to the air. <b>3</b>: a line from the ice tip into the nose. <b>4</b>: along that line the ice (5.0&nbsp;mm thick here) has a gradient of 0.070&nbsp;K/mm and the PLA 0.164&nbsp;K/mm. In steady 1D conduction the ratio would equal the conductivity ratio, 11; it is 2.3 here because heat also flows sideways and the PLA is still warming up. That difference is exactly what the 2D transient model is for.</figcaption>
+      </figure>
+
+      <p>The rime production path (<code>icing run-nodal</code>, and the rime campaigns built on it) is called the <em>nodal</em> path because the film, the phase balance and the solid all share the same boundary nodes. One coupled step (<code>nodal_coupling.advance_coupled_nodal_step</code>) refreshes CFD and droplet loads, then <code>nodal_snapshot.advance_snapshot_increment</code> holds those loads for one growth increment (4&nbsp;s nominal in the RG-15 cases), sub-stepped at <code>thermal_step</code> = 0.005&nbsp;s by <code>nodal_increment.advance_nodal_increment</code>: runback transport, then the phase/solid solve, repeated. At the end of the increment the frozen mass is added to the geometry as a new layer of ice (next sections).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="coupling">How the surface balance talks to the solid <span class="level intermediate">Intermediate</span></h2>
+      <p>The 2D version of the rung-2 trick lives in <code>solid_phase._phase_with_contact</code>. The solid's response at the wall nodes is condensed once per increment into a dense <em>contact conductance</em> matrix: if the wall temperatures are \( T_s \), the heat the solid takes is \( q = \Delta t\,G\,(T_s - T_{base}) \), where \( T_{base} \) is what the wall would read if no heat crossed it this step. Each wall node then has the surface balance of Step 5 with this conductive sink, solved together for all nodes:</p>
+<pre><code class="language-python">def terms(t):
+    ev=np.minimum(water,evaporation_flux(t,h,env)*lengths*dt)
+    conducted=dt*(conductance@(t-base))
+    cooling=dt*lengths*h*(t-recovery)
+    return ev,conducted,cooling
+...
+def residual(trial):
+    ev,q,cooling=terms(trial)
+    balance=source+(water-ev)*(LF-CI*(trial-TM))-q-cooling-ev*(LV+CVAP*(trial-TM))
+    return np.where(wet,trial-TM,balance/scale)
+</code></pre>
+      <div class="code-src">icing/solid_phase.py, _phase_with_contact() (excerpt)</div>
+      <p>The unknowns are the wall temperatures. Wet nodes are pinned at \( T_m \) (their freezing amount follows from the leftover heat); dry nodes solve the balance for their temperature. Which nodes are wet is itself decided by an <em>active-set</em> loop: a wet node whose freezing demand exceeds its water becomes dry; a dry node that would rise above \( T_m \) becomes wet. After convergence the solid is advanced once with the accepted wall powers, and three residuals are checked: surface, solid, and combined (<code>'Coupled solid/phase energy balance failed'</code> otherwise). Because \( G \) comes from the actual mesh, the coupling is implicit and exact for the linear solid; no iteration between "fluid side" and "solid side" is needed.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 250" role="img" aria-label="Contact coupling: wall nodes see the solid as a condensed conductance">
+          <defs>
+            <marker id="sc-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+            <marker id="sc-w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--warm)"/></marker>
+          </defs>
+          <rect x="20" y="30" width="230" height="190" rx="8" class="d-box"/>
+          <text x="135" y="55" text-anchor="middle" class="d-text" font-weight="700">surface (per wall node)</text>
+          <text x="35" y="85" class="d-muted">droplets: mass + sensible + kinetic</text>
+          <text x="35" y="108" class="d-muted">convection h (T_s − T_rec)</text>
+          <text x="35" y="131" class="d-muted">evaporation / sublimation</text>
+          <text x="35" y="154" class="d-muted">latent heat of new ice</text>
+          <text x="35" y="185" class="d-text">unknown: T_s, ice, film</text>
+          <rect x="550" y="30" width="230" height="190" rx="8" class="d-box"/>
+          <text x="665" y="55" text-anchor="middle" class="d-text" font-weight="700">solid (ice + skin)</text>
+          <text x="565" y="85" class="d-muted">(M/Δt + K) ΔT = powers</text>
+          <text x="565" y="108" class="d-muted">factorised once per increment</text>
+          <text x="565" y="131" class="d-muted">T_base: wall T with zero flux</text>
+          <text x="565" y="185" class="d-text">unknown: all node T</text>
+          <rect x="300" y="85" width="200" height="70" rx="8" class="d-accent"/>
+          <text x="400" y="113" text-anchor="middle" class="d-text">q = Δt G (T_s − T_base)</text>
+          <text x="400" y="136" text-anchor="middle" class="d-muted">G: dense contact conductance</text>
+          <line x1="250" y1="120" x2="296" y2="120" class="d-arrow" marker-end="url(#sc-a)"/>
+          <line x1="500" y1="120" x2="546" y2="120" class="d-arrow" marker-end="url(#sc-a)"/>
+          <path d="M546,190 C 470,235 330,235 254,190" stroke="var(--warm)" stroke-width="2" fill="none" marker-end="url(#sc-w)"/>
+          <text x="400" y="244" text-anchor="middle" class="d-muted">accepted T_s → advance solid once → check 3 energy residuals</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 4.</b> The solid enters the surface balance as a condensed linear response (<code>solid_phase._contact_conductance</code>, built from the factorised solid matrix with at most 32 right-hand sides at a time). The nonlinear part (wet/dry switching, evaporation) is solved only on the wall nodes.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="layers">Growth layers: the swept-cell inventory <span class="level advanced">Advanced</span></h2>
+      <p>When an increment ends, the frozen mass at each wall node becomes geometry. <code>nodal_growth.grow_nodal_deposition</code> moves each wall vertex outward to make room for the ice, and the region swept by each panel becomes one <strong>swept cell</strong>: a quadrilateral (or a triangle where two vertices merged) between the old and the new wall. All the cells of one increment form one <strong>layer</strong>. <code>material_inventory.IceInventory</code> stores the layers in order; each cell keeps its polygon and its <em>fragments</em>: which panel the ice came from, its mass, its enthalpy at deposition, its density and conductivity.</p>
+      <p>The rules are strict (<code>IceInventory.validate</code>): consecutive layers share their interface exactly, earlier layers are never stretched, and the fragment volumes (mass/density) must fill each cell's geometric area. "Appending growth never stretches existing layers" (module docstring). Then <code>solid_growth.append_conducting_layer</code> triangulates the new cells and adds them to the conduction mesh without moving any old node.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/solid_rime_layers.png" alt="Rime ice coloured by the time each growth layer was added, with a zoom on individual swept cells"></div>
+        <figcaption><b>Figure 5.</b> The same RG-15 rime state at 630&nbsp;s, now coloured by the time each layer was added. The checkpoint holds 258 layers, one per accepted increment (their durations add up to exactly 630&nbsp;s; increments shorter than 4&nbsp;s are halvings after a rejected growth step). <b>1</b>: the clean PLA wall; the first layers (dark) lie on it. <b>2</b>: the ice tip, where the youngest layer sits. <b>3</b>: one swept cell: the ice one panel swept in one increment. <b>4</b>: a wall vertex; the cell edges continue the paths the vertices took through the increments. At the tip the first layer was 43.5&nbsp;µm thick and the last 27.0&nbsp;µm. In the zoom, 15 layers (602-630&nbsp;s) alternate in two shades.</figcaption>
+      </figure>
+
+      <p>Why keep this history at all, if conduction runs on the triangle mesh? Three reasons, all from the code:</p>
+      <ul>
+        <li><strong>Material identity.</strong> Ice and substrate are told apart by geometry, never by their property values ("Material identity comes from geometry", ENTHALPY_CONDUCTION.md). The inventory is the geometric record.</li>
+        <li><strong>Audits.</strong> Every saved checkpoint (<code>nodal_checkpoint.save_nodal_checkpoint</code>, schema 2) re-validates the layers against the mesh and the energy ledger before writing.</li>
+        <li><strong>Later changes.</strong> When ice is cut back (recession) or re-resolved, the inventory changes type: <code>cut_inventory.CutIceInventory</code> keeps the clipped pieces with their provenance (schema 3), and <code>resolved_inventory.ResolvedIceInventory</code> ties each piece to a thermal material label on the mesh (schema 4). <code>load_nodal_checkpoint</code> reads all three.</li>
+      </ul>
+      <div class="callout why"><div class="callout-title">Why it is done this way</div>
+        <p>A fragment's deposition enthalpy is history, not the current state. CONDUCTING_GROWTH.md insists: "Fragment enthalpies remain deposition provenance after conduction; do not reinitialize the current solid from them." The current temperature lives on the mesh nodes; the inventory says what material is where. When new triangles join old ones, shared nodes mix their temperatures (capacity-weighted), which conserves energy exactly but smooths locally. A zero-time study (runs/growth_projection_refinement_001) measured that this smoothing error decays about linearly with layer thickness.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="enthalpy">Enthalpy: melting and freezing inside the solid <span class="level advanced">Advanced</span></h2>
+      <p>Rung 4 is a <em>cold</em> model: <code>SolidFEM</code> has no phase change, and the nodal path rejects any solid node above \( T_m \) ("Nodal solid temperature requires unsupported phase/range"). For glaze, the ice at the surface sits at 0&nbsp;°C under a liquid film, and warm water can melt into it. Temperature alone cannot describe a node that is half ice and half water: both are at exactly 0&nbsp;°C. The fix is to use <strong>enthalpy</strong> \( H \) (energy content, J per metre of span) as the unknown, and derive temperature and liquid fraction from it.</p>
+      <p>With liquid water at \( T_m \) as zero, a node holding water mass \( m \) (ice plus liquid) and non-melting capacity \( C \) (the skin) follows (<code>docs/ENTHALPY_CONDUCTION.md</code>):</p>
+      $$ H = \begin{cases} -m L_f + (C + m c_i)(T - T_m) & \text{cold ice},\ H &lt; -mL_f \\ \text{any value in } [-mL_f,\,0],\ T = T_m & \text{mixed, liquid } m + H/L_f \\ (C + m c_w)(T - T_m) & \text{warm liquid},\ H &gt; 0 \end{cases} $$
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 300" role="img" aria-label="Enthalpy versus temperature with a vertical latent jump at the melting point">
+          <defs>
+            <marker id="eh-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+          </defs>
+          <line x1="80" y1="270" x2="760" y2="270" class="d-line" marker-end="url(#eh-a)"/>
+          <line x1="80" y1="280" x2="80" y2="20" class="d-line" marker-end="url(#eh-a)"/>
+          <text x="740" y="292" class="d-muted">T</text>
+          <text x="45" y="30" class="d-muted">H</text>
+          <line x1="420" y1="270" x2="420" y2="30" stroke="var(--border)" stroke-dasharray="4 4"/>
+          <text x="420" y="292" text-anchor="middle" class="d-muted">T_m = 273.15 K</text>
+          <line x1="80" y1="95" x2="420" y2="95" stroke="var(--border)" stroke-dasharray="2 4"/>
+          <text x="90" y="89" class="d-muted">H = 0</text>
+          <line x1="80" y1="232" x2="420" y2="232" stroke="var(--border)" stroke-dasharray="2 4"/>
+          <text x="90" y="226" class="d-muted">H = −m L_f</text>
+          <!-- cold branch -->
+          <line x1="110" y1="262" x2="420" y2="232" stroke="var(--accent)" stroke-width="3"/>
+          <text x="120" y="248" class="d-text">cold ice: slope C + m c_i</text>
+          <!-- plateau -->
+          <line x1="420" y1="232" x2="420" y2="95" stroke="var(--ok)" stroke-width="5"/>
+          <!-- warm branch -->
+          <line x1="420" y1="95" x2="720" y2="40" stroke="var(--warm)" stroke-width="3"/>
+          <text x="540" y="56" class="d-text">warm water: slope C + m c_w</text>
+          <text x="432" y="170" class="d-text">mixed: T = T_m</text>
+          <text x="432" y="190" class="d-muted">liquid = m + H/L_f</text>
+          <text x="245" y="160" class="d-muted" text-anchor="middle">latent jump m L_f</text>
+          <path d="M330,232 L330,95" stroke="var(--muted)" stroke-width="1" marker-end="url(#eh-a)"/>
+          <text x="432" y="248" class="d-muted">H = −m L_f (just frozen)</text>
+          <text x="432" y="118" class="d-muted">H = 0 (just melted)</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 6.</b> The sharp enthalpy-temperature relation of <code>enthalpy_conduction.equilibrium</code> (not to scale). Along the vertical segment the temperature stays at \( T_m \) while the liquid fraction goes from 0 to 1. There is no artificial "mushy" temperature range: the jump is exact. The two kinks, at \( H = -mL_f \) and \( H = 0 \), are where most numerical trouble starts (<a href="glaze.html">Step 10</a>).</figcaption>
+      </figure>
+
+<pre><code class="language-python">cold=h &lt; -m*LF; warm=h&gt;0
+cc=c+m*CI; cw=c+m*CW
+temperature=np.where(cold,(h+m*LF)/cc,temperature)
+temperature=np.where(warm,h/cw,temperature)
+liquid=np.where(cold,0.,np.where(warm,m,m+h/LF))
+</code></pre>
+      <div class="code-src">icing/enthalpy_conduction.py, equilibrium() (excerpt)</div>
+      <p>One time step of <code>advance_enthalpy</code> then solves, for every node at once, the backward-Euler balance</p>
+      $$ H^{new} - H^{old} + \Delta t\,\big[K\,(T(H^{new}) - T_m) + R\,T(H^{new}) - b\big] = \Delta t\,P. $$
+      <p>The temperature is a non-smooth function of \( H \) (flat on the plateau), so this is a non-smooth nonlinear system. The solver tries, in order, a <strong>primal-dual active set</strong> (fix each node's branch, cold, plateau or warm, solve the resulting linear system exactly, reassign branches, repeat), a line-searched semismooth Newton method, a smoothed convex Newton continuation, and finally Gauss-Seidel sweeps that invert each scalar balance exactly. All paths share the same acceptance test: every nodal residual within \( 10^{-9} \) relative plus a floating-point bound, temperatures in 223.15-313.15&nbsp;K, and a global energy audit. A failure raises <code>ThermalStepLimit</code> ("reduce timestep"); nothing is clipped.</p>
+<pre><code class="language-python">balance=h-old+dt*(stiffness@theta-forcing)
+if (not np.isfinite(h).all() or np.any(abs(balance)&gt;1e-9*scale+roundoff(theta))
+        or np.any(t&lt;223.15) or np.any(t&gt;313.15)):
+    raise ThermalStepLimit('Enthalpy conduction failed residual or temperature-range check ...')
+...
+error=float(np.sum(h-old)-external)
+if abs(error)&gt;1e-9*max(1.,float(np.sum(abs(h-old)+dt*(abs(p)+abs(boundary_power)))))+attainable:
+    raise ThermalStepLimit('Enthalpy conduction global energy audit failed ...')
+</code></pre>
+      <div class="code-src">icing/enthalpy_conduction.py, advance_enthalpy() (end of function, simplified)</div>
+
+      <p>Two helpers make the enthalpy solid usable with growing ice:</p>
+      <ul>
+        <li><code>element_phase.partition_enthalpy</code> splits each node's ice and liquid back onto the triangles around it, in the same equal-thirds shares used to lump them. It "retains melt location" so later steps know <em>which elements</em> hold water; it does not invent a sharp front inside a triangle.</li>
+        <li><code>enthalpy_growth.append_enthalpy_layer</code> adds new frozen ice to the mesh while copying the old nodal enthalpy verbatim. The older temperature-only append (<code>append_conducting_layer</code>) could not, because a node at exactly 0&nbsp;°C may hold any amount of latent energy. New element mass and enthalpy are lumped to corners; shared nodes re-equilibrate, which COLUMN_ICE_GROWTH.md warns "may melt some newly added ice beside warm retained material" as a projection effect.</li>
+      </ul>
+      <p>On the glaze path the solid enthalpy, the solid water mass and the substrate capacity are stored explicitly in a <code>CoupledColumnHistory</code> (<code>coupled_column_checkpoint.py</code>), together with the film columns on top; <a href="glaze.html">Step 10</a> follows that story.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="remesh">Remeshing the solid without losing heat <span class="level advanced">Advanced</span></h2>
+      <p>Appending a layer per increment never removes a node. On the glaze path, where ice is promoted in thin layers, the solid mesh of RG-15 case 3.2 had grown to 63,606 nodes by 1200&nbsp;s, with minimum angles of 0.04° and 15&nbsp;% positive off-diagonal matrix entries (GLAZE_ISSUE_HISTORY O10, GLAZE_ROBUSTNESS R26). Positive off-diagonals mean the matrix is no longer an M-matrix, so the discrete solution can overshoot. Three tools exist to keep the solid mesh healthy:</p>
+      <ul>
+        <li><strong>Conservative transfer</strong>, <code>solid_remap.transfer_solid_temperature</code>: given any new conforming mesh of the same domain, intersect every old/new triangle pair exactly, integrate products of the linear shape functions, weight by heat capacity, and divide by the new nodal capacity. Triangles that did not change copy their contribution exactly. The result conserves sensible energy to round-off, keeps every temperature inside the old range, and refuses to mix two material regions (docs/SOLID_REMESH_TRANSFER.md).</li>
+        <li><strong>Bounded coarsening</strong> for the rime path, <code>solid_maintenance.maintain_nodal_solid</code> (case option <code>solid_maintenance</code>): remove interior nodes on edges shorter than <code>min_edge</code> by ear-clipping the node's star, only if the local quality improves and all incident triangles share one material label, then transfer as above.</li>
+        <li><strong>Gmsh re-triangulation</strong> for the glaze path, <code>coupled_solid_remesh.remesh_coupled_ice</code> (glaze control <code>solid_remesh</code>): every connected ice component is re-meshed with all its boundary vertices and material interfaces fixed. The water's specific enthalpy is projected with the same positive overlap transfer, the mass is normalised (the factor must differ from one by round-off only) and a uniform shift closes the last round-off in energy.</li>
+      </ul>
+<pre><code class="language-python">remap=transfer_solid_temperature(old_sub,new_sub,specific[nodes])
+old_mass=float(element[region].sum())
+mass=new_sub.volumetric_capacity*new_sub.area/CI
+factor=old_mass/float(mass.sum())
+if abs(factor-1)&gt;NORMALIZATION_LIMIT:
+    raise ValueError(f'Ice remesh mass normalization {factor-1:.3g} exceeds roundoff')
+...
+shift=(old_energy-float(nodal@remap.temperature))/old_mass
+</code></pre>
+      <div class="code-src">icing/coupled_solid_remesh.py, _remesh() (simplified)</div>
+
+      <figure>
+        <div class="frame"><img src="figures/solid_remesh_before_after.png" alt="Solid mesh of glaze ice before and after Gmsh re-triangulation, wide view and zoom"></div>
+        <figcaption><b>Figure 7.</b> <code>remesh_coupled_ice</code> run locally (Gmsh 4.13.1, 5&nbsp;s) on the returned RG-15 glaze 3.1 checkpoint at 1198&nbsp;s (<code>runs/nibi/glz81_31/.../shot_07/ice/slot_0</code>). Top: the leading edge; bottom: the orange box. <b>1, 2</b>: before, every promotion left a layer of thin triangles along the wall; in the zoom they are stacked slivers (shape quality as low as 0.002, where 1 is equilateral). After: 168 ice triangles instead of 548 in the top view; 4 instead of 109 have quality below 0.05. <b>3</b>: wall vertices are kept exactly, so the film columns and the CFD wall are untouched. <b>4</b>: the ice/PLA interface is kept exactly. Whole mesh: 15,087 → 14,609 nodes (the run's own remesh at 1200&nbsp;s also ended at 14,609), positive off-diagonal fraction 1.12&nbsp;% → 0.25&nbsp;%, mass change 2.8×10⁻¹⁷&nbsp;kg/m, energy change 0&nbsp;J/m, temperature range unchanged (−1.79 to 0&nbsp;°C). The minimum angle (0.055°) does not change: it is the taper of the deposit edge, fixed by the boundary.</figcaption>
+      </figure>
+
+      <div class="callout limits"><div class="callout-title">What remeshing costs physically</div>
+        <p>The projection smooths gradients inside the ice; it is "not point interpolation" (module docstring). The 2026-11-12 entry of PHYSICS_REVIEW.md measured the effect on RG-15 3.1 shot 1: total ice +0.011&nbsp;% with three remeshes, film −0.2&nbsp;%. It also records a cost limit: the overlap search is a Python loop, and a first remesh of the un-remeshed 63,606-node state did not finish in 25 minutes. Hence the advice to enable it from the first shot.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="stefan">Checking against an exact answer: the Stefan problem <span class="level advanced">Advanced</span></h2>
+      <p>Conservation checks show that no energy is lost. They do not show that the energy goes to the right place at the right time. For that the project uses the classical <strong>one-phase Stefan problem</strong>: liquid water at \( T_m \) freezes onto a wall held at a cold temperature \( T_c \). Nothing else happens: no air, no evaporation. It has an exact similarity solution (PHYSICS_REVIEW.md, "Governing thermal balance"):</p>
+      $$ s(t) = 2\lambda\sqrt{\alpha t}, \qquad \lambda\, e^{\lambda^2}\,\mathrm{erf}(\lambda) = \frac{c_i (T_m - T_c)}{L_f \sqrt{\pi}}, \qquad \alpha = \frac{k}{\rho c_i}, $$
+      <p>where \( s \) is the ice thickness. With \( T_c = -10 \)&nbsp;°C, \( k = 2.2 \), \( \rho = 917 \), the Stefan number is 0.0629 and \( \lambda = 0.1756 \) (<code>runs/stefan_growth_verification_001/report.json</code>). Three independent tools check three rungs of the ladder:</p>
+      <ul>
+        <li><code>tools/verify_stefan_growth.py</code>: the growing column (rung 3), from 1 to 3&nbsp;s, cells and steps refined together.</li>
+        <li><code>tools/verify_nodal_stefan_growth.py</code>: the 2D nodal solid with layer insertion (rung 4), report in <code>runs/stefan_growth_001</code>.</li>
+        <li><code>tools/run_coupled_stefan_matrix.py</code>: the coupled enthalpy history of the glaze path (rung 5), here as <em>melting</em> with an imposed similarity heat flux; a 3×3 space/time matrix run by the user (<code>tmp/coupled-stefan-matrix-1</code>, docs/COUPLED_STEFAN_RETURN.md).</li>
+      </ul>
+
+      <figure>
+        <div class="frame"><img src="figures/solid_stefan.png" alt="Stefan problem: computed and exact ice thickness over time, and error versus refinement for three models"></div>
+        <figcaption><b>Figure 8.</b> Left: the column benchmark recomputed here with the loop of <code>verify_stefan_growth.py</code> (0.3&nbsp;s of computing). All three resolutions sit on the exact curve; the inset compares the final temperature profile with the exact erf profile. Final thickness errors 0.270&nbsp;%, 0.135&nbsp;%, 0.067&nbsp;%, identical to the saved report. Right: relative front error against refinement for the three tools. Growth by column and by 2D nodal solid both halve their error at every refinement: first-order convergence, as expected from adding ice after each conduction step. The coupled melting matrix (diagonal 32/64, 64/128, 128/256 cells/steps) falls from 1.99&nbsp;% to 0.34&nbsp;% and then flattens: its report shows the remaining error is set by the initial nodal projection and space, not by time (time change 0.005&nbsp;%, space change 0.75&nbsp;%).</figcaption>
+      </figure>
+
+      <div class="table-wrap"><table>
+        <tr><th>Benchmark</th><th>Finest error</th><th>Energy residual</th><th>Source</th></tr>
+        <tr><td>Column growth (64 cells, 160 steps)</td><td>0.0673&nbsp;%</td><td>&lt; 2×10⁻¹⁰ J/m²</td><td>runs/stefan_growth_verification_001</td></tr>
+        <tr><td>2D nodal growth (32 layers, 32 steps)</td><td>0.150&nbsp;%</td><td>6×10⁻⁸ J/m</td><td>runs/stefan_growth_001</td></tr>
+        <tr><td>Coupled enthalpy melting (128 cells, 256 steps)</td><td>0.337&nbsp;% (limit 2&nbsp;%)</td><td>2.3×10⁻⁹ J/m</td><td>tmp/coupled-stefan-matrix-1</td></tr>
+      </table></div>
+      <p>Two follow-up studies separate the refinement axes for the nodal solid. At a fixed initial mesh the error still halves with growth/time refinement (ratios 0.489-0.495, <code>runs/stefan_refinement_axes_001</code>), and refining only the new layers (1 to 8 subdivisions) changes the error from 0.303012&nbsp;% to 0.302906&nbsp;% (<code>runs/stefan_new_layer_resolution_002</code>). The conclusion recorded in PHYSICS_REVIEW.md: in this test the timing of growth updates dominates the error, not spatial resolution.</p>
+      <div class="callout limits"><div class="callout-title">What the Stefan checks do not show</div>
+        <p>Every report carries <code>"physical_validation": false</code>. These are planar, pure-ice problems with the front forced to be flat. They verify that the discrete equations converge to the continuum equations. They say nothing about the heat-transfer coefficient, droplet collection, curved fronts, runback or real ice shapes. PHYSICS_REVIEW.md: "This verifies a special freezing problem, not airfoil icing experiments."</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="limits">Assumptions and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li><strong>Perfect contact.</strong> Ice and substrate, and successive ice layers, are bonded without contact resistance (<code>advance_column</code>: "perfect thermal contact").</li>
+          <li><strong>Constant, isotropic properties.</strong> Ice \( k = 2.2 \), \( c_i = 2100 \); no temperature dependence. Liquid inside the enthalpy solid does not change the element conductivity ("Conductivity is held fixed", ENTHALPY_CONDUCTION.md).</li>
+          <li><strong>Lagged growth.</strong> New ice joins the mesh after the conduction step; the error is first order in the growth increment (Stefan studies above).</li>
+          <li><strong>Interface smoothing.</strong> Adding layers and remeshing mix nodal temperatures conservatively but not locally exactly.</li>
+          <li><strong>Equilibrium phase change.</strong> No supercooled liquid inside the solid, no nucleation kinetics; no liquid flow inside melted solid elements.</li>
+          <li><strong>Cold nodal path.</strong> The rime path cannot represent melting; a warm dry wall is reported as unsupported.</li>
+          <li><strong>Mesh quality.</strong> Linear triangles with obtuse angles do not guarantee a discrete maximum principle; the remesh tools reduce but do not remove this (minimum angle is set by the deposit edge).</li>
+          <li><strong>Validation.</strong> The solid models are verified against exact solutions and conservation checks. No comparison of measured ice or substrate temperatures has been made.</li>
+        </ul></div>
+
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p><code>icing/substrate.py</code> → <code>advance_slab</code>, <code>advance_column</code> · <code>icing/thermal_coupling.py</code> → <code>phase_with_substrate</code>, <code>phase_with_column</code> · <code>icing/ice_column.py</code> → <code>grow_column</code> · <code>icing/column_remap.py</code> → <code>remesh_column</code> · <code>icing/solid_fem.py</code> → <code>SolidFEM</code> · <code>icing/solid_phase.py</code> → <code>_phase_with_contact</code> · <code>icing/nodal_increment.py</code>, <code>nodal_snapshot.py</code>, <code>nodal_coupling.py</code>, <code>nodal_checkpoint.py</code> · <code>icing/material_inventory.py</code>, <code>cut_inventory.py</code>, <code>resolved_inventory.py</code> · <code>icing/solid_growth.py</code> → <code>append_conducting_layer</code> · <code>icing/enthalpy_conduction.py</code> → <code>equilibrium</code>, <code>advance_enthalpy</code> · <code>icing/element_phase.py</code> · <code>icing/enthalpy_growth.py</code> · <code>icing/solid_remap.py</code>, <code>solid_maintenance.py</code>, <code>coupled_solid_remesh.py</code> · <code>tools/verify_stefan_growth.py</code>, <code>verify_nodal_stefan_growth.py</code>, <code>run_coupled_stefan_matrix.py</code>. Figures: <code>_build/fig_solid.py</code>.</p></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Big Picture · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Section 1 · Start here</div>
+      <h1>The big picture</h1>
+      <p class="lede">What the icing solver computes, the loop it repeats, how time is split up, and how the
+        code is organised. Read this page first; every later page zooms into one box of the diagrams below.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#goal">What the solver is for</a> <span class="level basic">Basic</span></li>
+          <li><a href="#loop">The icing loop in six steps</a> <span class="level basic">Basic</span></li>
+          <li><a href="#time">Three clocks: shots, increments, thermal steps</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#models">Two ice models: rime and glaze</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#example">A real run, start to finish</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#code">How the code is organised</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#principles">Design rules that run through the code</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#path">Where to go next</a></li>
+        </ol>
+      </div>
+
+      <h2 id="goal">What the solver is for <span class="level basic">Basic</span></h2>
+      <p>When an aircraft flies through a cloud of <strong>supercooled water droplets</strong> (liquid water
+        below 0 °C), the droplets that hit the wing freeze onto it. The ice changes the wing's shape, and a
+        changed shape can lose lift, gain drag and stall earlier. This project predicts <em>what shape the ice
+        takes</em> on a two-dimensional wing section (an airfoil) and <em>how the airflow changes</em> because
+        of it.</p>
+      <p>It does this by simulation. A computer fluid dynamics (CFD) code called <strong>SU2</strong> computes
+        the airflow. A Python package called <code>icing</code> does everything else: it tracks droplets,
+        works out how much water freezes, conducts heat through the ice, moves the wall outward, and keeps the
+        CFD mesh usable as the ice grows. Everything is in real physical units (metres, seconds, kelvin,
+        kilograms per metre of span).</p>
+
+      <figure>
+        <div class="frame"><img src="figures/overview_rg15_iced.png" alt="RG-15 airfoil with computed ice on its leading edge, with a zoomed inset"></div>
+        <figcaption><b>Figure 1.</b> A real result from this solver: the RG-15 airfoil (0.3 m chord) after 830 s
+          in a supercooled cloud at 25 m/s and −4 °C (case 3.2 of the 2nd Ice Prediction Workshop). Grey is
+          the clean airfoil; blue is the computed ice. The ice is only millimetres thick on a 300 mm wing, so
+          most figures in this guide zoom in on the leading edge. Data: <code>runs/nibi/glz81_32</code>, shot 5.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>The solver repeats one idea many times: <em>compute the air → see where water lands → decide how much
+          of it freezes → add that ice to the wall → fix the mesh → compute the air again.</em> Because the
+          ice changes the airflow, and the airflow changes where the next ice goes, the loop has to be
+          repeated as the ice grows.</p></div>
+
+      <div class="callout limits"><div class="callout-title">Status, stated up front</div>
+        <p>The project is honest about what is proven. The numerics are heavily verified (conservation
+          checks, analytical test problems, more than 200 test files). But <strong>no claim of physical
+          validation</strong> against experiments is made yet: the comparisons with measured ice shapes are
+          still in progress. The <a href="validation.html">validation page</a> explains the difference.</p></div>
+
+      <h2 id="loop">The icing loop in six steps <span class="level basic">Basic</span></h2>
+      <p>Figure 2 is the map for the whole guide. Each box is one detailed page.</p>
+
+      <figure class="wide">
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 900 470" role="img" aria-label="The icing loop: airflow, droplets, energy balance and film, heat in ice, growth, mesh adaptation, then back to airflow">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+          </defs>
+          <!-- boxes on a ring -->
+          <g>
+            <rect x="345" y="18" width="210" height="78" rx="12" class="d-accent"/>
+            <text x="450" y="46" text-anchor="middle" class="d-text" font-weight="700">1 · Airflow (SU2)</text>
+            <text x="450" y="66" text-anchor="middle" class="d-muted">velocity, pressure, shear,</text>
+            <text x="450" y="82" text-anchor="middle" class="d-muted">heat-transfer coefficient</text>
+          </g>
+          <g>
+            <rect x="640" y="110" width="220" height="78" rx="12" class="d-accent"/>
+            <text x="750" y="138" text-anchor="middle" class="d-text" font-weight="700">2 · Droplets</text>
+            <text x="750" y="158" text-anchor="middle" class="d-muted">trajectories → where water</text>
+            <text x="750" y="174" text-anchor="middle" class="d-muted">hits the wall (β, kg/s/m)</text>
+          </g>
+          <g>
+            <rect x="640" y="270" width="220" height="78" rx="12" class="d-warm"/>
+            <text x="750" y="298" text-anchor="middle" class="d-text" font-weight="700">3 · Freezing + film</text>
+            <text x="750" y="318" text-anchor="middle" class="d-muted">energy balance: how much</text>
+            <text x="750" y="334" text-anchor="middle" class="d-muted">freezes, how much runs back</text>
+          </g>
+          <g>
+            <rect x="345" y="370" width="210" height="78" rx="12" class="d-warm"/>
+            <text x="450" y="398" text-anchor="middle" class="d-text" font-weight="700">4 · Heat in the ice</text>
+            <text x="450" y="418" text-anchor="middle" class="d-muted">conduction through ice and</text>
+            <text x="450" y="434" text-anchor="middle" class="d-muted">substrate (2D solid mesh)</text>
+          </g>
+          <g>
+            <rect x="40" y="270" width="220" height="78" rx="12" class="d-ok"/>
+            <text x="150" y="298" text-anchor="middle" class="d-text" font-weight="700">5 · Grow the wall</text>
+            <text x="150" y="318" text-anchor="middle" class="d-muted">frozen mass → volume →</text>
+            <text x="150" y="334" text-anchor="middle" class="d-muted">new ice surface</text>
+          </g>
+          <g>
+            <rect x="40" y="110" width="220" height="78" rx="12" class="d-ok"/>
+            <text x="150" y="138" text-anchor="middle" class="d-text" font-weight="700">6 · Adapt the mesh</text>
+            <text x="150" y="158" text-anchor="middle" class="d-muted">refine wall, deform or</text>
+            <text x="150" y="174" text-anchor="middle" class="d-muted">remesh, warm-start CFD</text>
+          </g>
+          <!-- arrows -->
+          <path d="M555,60 C 620,62 700,80 735,106" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M750,190 L750,266" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M735,350 C 700,385 620,405 559,408" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M345,408 C 280,405 200,385 165,352" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M150,268 L150,192" class="d-arrow" marker-end="url(#ah)"/>
+          <path d="M165,108 C 200,80 280,62 341,60" class="d-arrow" marker-end="url(#ah)"/>
+          <!-- inner loop between 3,4,5 -->
+          <path d="M640,318 C 520,300 380,300 264,312" class="d-line" stroke-dasharray="5 4" marker-end="url(#ah)"/>
+          <text x="450" y="245" text-anchor="middle" class="d-text" font-weight="700">steps 3–5 repeat every few seconds</text>
+          <text x="450" y="265" text-anchor="middle" class="d-muted">on frozen airflow and droplet loads</text>
+          <text x="450" y="160" text-anchor="middle" class="d-text" font-weight="700">the whole ring = one "shot"</text>
+          <text x="450" y="180" text-anchor="middle" class="d-muted">(typically 30–200 s of icing time)</text>
+          <!-- page labels -->
+          <text x="450" y="112" text-anchor="middle" class="d-muted">airflow.html</text>
+          <text x="750" y="205" text-anchor="middle" class="d-muted">droplets.html</text>
+          <text x="750" y="365" text-anchor="middle" class="d-muted">thermo.html · film.html</text>
+          <text x="450" y="464" text-anchor="middle" class="d-muted">solid.html</text>
+          <text x="150" y="365" text-anchor="middle" class="d-muted">growth.html</text>
+          <text x="150" y="205" text-anchor="middle" class="d-muted">mesh.html</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 2.</b> The icing loop. One trip round the ring is a <b>shot</b>. Inside a shot,
+          the airflow and droplet impact rates are held fixed while steps 3–5 run many short growth
+          increments (dashed arrow). At the end of the shot the mesh is adapted to the new ice and the
+          airflow is computed again.</figcaption>
+      </figure>
+
+      <ol class="steps">
+        <li><strong>Airflow.</strong> SU2 solves the steady, incompressible Reynolds-averaged Navier–Stokes
+          equations around the current (iced) shape. The solver needs four things from it: the velocity field
+          (to move droplets), and along the wall the pressure, the shear stress (to push the water film) and
+          the heat-transfer coefficient, HTC (how fast the air cools the surface). A shot's CFD only counts
+          once it passes convergence gates. <a href="airflow.html">More →</a></li>
+        <li><strong>Droplets.</strong> Thousands of droplets are released upstream and followed through the
+          airflow with a drag law. Small droplets follow the air round the wing; large ones keep going straight
+          and hit it. Each droplet carries a known water mass flow, so the hits add up to an impingement rate on
+          every wall panel. Its dimensionless form is the <em>collection efficiency</em> β. <a href="droplets.html">More →</a></li>
+        <li><strong>Freezing and film.</strong> On each wall panel a mass and energy balance decides how much
+          of the arriving water freezes. When it is cold enough, all of it freezes on impact: that is
+          <em>rime</em>. Otherwise only part freezes and the rest forms a thin liquid film that the air pushes
+          downstream: that is <em>glaze</em> and <em>runback</em>. <a href="thermo.html">Energy →</a>
+          <a href="film.html">Film →</a></li>
+        <li><strong>Heat in the ice.</strong> Latent heat released by freezing has to go somewhere. Some goes
+          into the air, some into the ice and the airfoil beneath. The solver conducts heat through a 2D
+          triangle mesh of the ice and substrate, with a phase-change (enthalpy) formulation. <a href="solid.html">More →</a></li>
+        <li><strong>Growth.</strong> The frozen mass is turned into volume using the ice density, and the wall
+          moves outward. Each growth step adds a thin layer of cells to the solid. Corners and pockets need
+          special care so the surface stays physical. <a href="growth.html">More →</a></li>
+        <li><strong>Mesh adaptation.</strong> The CFD mesh has to follow the new wall. The solver first refines
+          the wall where panels have stretched. It then either deforms the old mesh or builds a new one with
+          proper boundary-layer cells. Finally it maps the previous flow solution onto the new mesh, so the
+          next CFD solve starts warm. <a href="mesh.html">More →</a></li>
+      </ol>
+
+      <h2 id="time">Three clocks: shots, increments, thermal steps <span class="level intermediate">Intermediate</span></h2>
+      <p>Ice grows over minutes, but the heat and water physics happen over milliseconds. A CFD solve costs
+        hours. The solver deals with this mismatch by using three nested time steps. The values below are
+        from the real RG-15 case 3.2 campaign file (<code>runs/nibi/glz81_32/package/campaign_32.json</code>).</p>
+
+      <div class="facts">
+        <div class="fact"><div class="v">30–200 s</div><div class="k"><b>Shot</b>: airflow and droplets recomputed once. Schedule 30, 200, 200, 200, 200, 200, 170 s = 1200 s total.</div></div>
+        <div class="fact"><div class="v">4 s</div><div class="k"><b>Growth increment</b> (<code>ice.increment</code>): the wall moves once and the solid gets a new layer.</div></div>
+        <div class="fact"><div class="v">5 ms</div><div class="k"><b>Thermal step</b> (<code>ice.thermal_step</code>): film transport, freezing and conduction substeps.</div></div>
+      </div>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 210" role="img" aria-label="Nested time steps">
+          <text x="20" y="30" class="d-text" font-weight="700">Shot (e.g. 200 s)</text>
+          <rect x="20" y="40" width="760" height="34" rx="6" class="d-accent"/>
+          <text x="30" y="62" class="d-muted">CFD + droplets once at the start · then 50 increments on those frozen loads · then mesh adaptation</text>
+          <text x="20" y="104" class="d-text" font-weight="700">Growth increment (4 s)</text>
+          <g>
+            <rect x="20" y="114" width="60" height="30" rx="5" class="d-ok"/>
+            <rect x="84" y="114" width="60" height="30" rx="5" class="d-ok"/>
+            <rect x="148" y="114" width="60" height="30" rx="5" class="d-ok"/>
+            <rect x="212" y="114" width="60" height="30" rx="5" class="d-ok"/>
+            <text x="290" y="134" class="d-muted">… 50 per 200 s shot; each ends with the wall moving once</text>
+          </g>
+          <text x="20" y="176" class="d-text" font-weight="700">Thermal step (5 ms)</text>
+          <g fill="var(--warm)">
+            <rect x="20" y="186" width="3" height="16"/><rect x="26" y="186" width="3" height="16"/><rect x="32" y="186" width="3" height="16"/>
+            <rect x="38" y="186" width="3" height="16"/><rect x="44" y="186" width="3" height="16"/><rect x="50" y="186" width="3" height="16"/>
+            <rect x="56" y="186" width="3" height="16"/><rect x="62" y="186" width="3" height="16"/><rect x="68" y="186" width="3" height="16"/>
+            <rect x="74" y="186" width="3" height="16"/>
+          </g>
+          <text x="92" y="199" class="d-muted">… 800 per increment: film flow, freezing, heat conduction</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 3.</b> Nested time scales. Inside each shot the airflow is treated as frozen.
+          That is the main modelling approximation in time. Whether a shot is short enough is a numerical
+          question that the campaign plans test explicitly.</figcaption>
+      </figure>
+
+      <div class="callout why"><div class="callout-title">Why not recompute the airflow every 4 s?</div>
+        <p>Cost. The campaign records the <em>longest</em> time each kind of stage has taken
+          (<code>Timings</code> in <code>campaign.py</code>, saved in <code>results_32/timings.json</code>). For
+          case 3.2: about 3,000 s of wall time for a 10,000-iteration CFD block (a shot needs several blocks),
+          about 2,800 s for a droplet collection, about 95 s for one 4 s ice increment, and about 26 s for a mesh
+          adaptation. Refreshing the airflow and droplets every 4 s would multiply the CFD and collection cost
+          by 50 per shot. So they are refreshed once per shot, and the ice physics runs its 50 increments on
+          those frozen loads.</p></div>
+
+      <h2 id="models">Two ice models: rime and glaze <span class="level intermediate">Intermediate</span></h2>
+      <p>The campaign file selects an <code>ice_model</code>. The two paths share steps 1, 2 and 6 but use
+        different physics for steps 3–5.</p>
+      <div class="table-wrap"><table>
+        <tr><th></th><th>Rime path (conducting "nodal" solid)</th><th>Glaze path (phase-aware)</th></tr>
+        <tr><td>When</td><td>Cold conditions where essentially all water freezes on impact.</td><td>Near 0 °C: liquid film, partial freezing, possible melting.</td></tr>
+        <tr><td>Surface water</td><td>Equilibrium film at 0 °C; strict rime mode forbids leftover liquid.</td><td>Water stored in "columns" of cells above the wall, with its own enthalpy; runback, vapour exchange, runoff exits.</td></tr>
+        <tr><td>Solid</td><td>2D conducting ice + substrate mesh, growing layer by layer.</td><td>Same 2D solid, plus melting and refreezing, crusts and the promotion of column ice into the CFD-visible wall.</td></tr>
+        <tr><td>Main code</td><td><code>nodal_*.py</code>, <code>campaign.run_ice</code></td><td><code>glaze_campaign.py</code>, <code>phase_*.py</code>, <code>coupled_*.py</code></td></tr>
+        <tr><td>Pages</td><td><a href="thermo.html">5</a>, <a href="solid.html">7</a>, <a href="growth.html">8</a></td><td><a href="glaze.html">10</a> (after 5–8)</td></tr>
+      </table></div>
+
+      <h2 id="example">A real run, start to finish <span class="level intermediate">Intermediate</span></h2>
+      <p>The RG-15 case 3.2 campaign (<code>glz81_32</code>) ran on the Nibi cluster. Its conditions, from
+        <code>nodal_case_32.json</code>: 25 m/s, angle of attack 0°, air at 269.15 K (−4 °C), liquid water
+        content 0.52 g/m³ in seven droplet-size bins, SST turbulence model with 0.5 mm sand-grain roughness,
+        ice density 917 kg/m³. Here is what each shot did (from <code>shot_NN/ice/summary.json</code> and
+        <code>shot_NN/adapt/quality.json</code>):</p>
+      <div class="table-wrap"><table>
+        <tr><th>Shot</th><th>Time (s)</th><th>Increments</th><th>Solid ice (kg/m)</th><th>Mesh decision</th><th>Wall vertices</th><th>Fluid points</th></tr>
+        <tr><td>1</td><td>0–30</td><td>8</td><td>0.0044</td><td>DEFORM</td><td>890</td><td>73,506</td></tr>
+        <tr><td>2</td><td>30–230</td><td>50</td><td>0.0360</td><td>REMESH</td><td>913</td><td>137,609</td></tr>
+        <tr><td>3</td><td>230–430</td><td>50</td><td>0.0672</td><td>REMESH</td><td>947</td><td>140,741</td></tr>
+        <tr><td>4</td><td>430–630</td><td>50</td><td>0.0981</td><td>REMESH</td><td>996</td><td>143,460</td></tr>
+        <tr><td>5</td><td>630–830</td><td>50</td><td>0.1295</td><td>REMESH</td><td>1,067</td><td>150,023</td></tr>
+      </table></div>
+      <p>Notice three things. The ice mass grows almost linearly, by about 0.031 kg/m per 200 s shot. The
+        number of wall vertices increases as the wall is refined around the growing ice. And after shot 1 the
+        mesh had to be rebuilt each time rather than just deformed. Shot 6 of this run stopped during its
+        growth step; the run's diagnosis led to code changes described on the <a href="glaze.html">glaze</a>
+        and <a href="growth.html">growth</a> pages.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/overview_leading_edge.png" alt="Leading edge of the RG-15 airfoil with computed ice after 830 s"></div>
+        <figcaption><b>Figure 4.</b> The leading edge at 830 s, zoomed. <b>(1)</b> The front of the ice, near
+          the stagnation point, where most droplets hit. Its rough, faceted outline comes from the
+          wall-panel discretization and the local growth law (<a href="growth.html">growth page</a>).
+          <b>(2)</b> The upper edge of the thick ice cap, where the ice tapers to a thin layer.
+          <b>(3)</b> On the lower (pressure) side the ice extends further back, following the droplet
+          impingement and the runback water. <b>(4)</b> The original leading edge, now buried inside the ice.
+          For comparison with the measured experimental shape, see the <a href="validation.html">validation page</a>.</figcaption>
+      </figure>
+
+      <h2 id="code">How the code is organised <span class="level advanced">Advanced</span></h2>
+      <p>The <code>icing</code> package has about 130 modules (roughly 22,000 lines). They fall into layers.
+        The <a href="code-map.html">code map</a> lists every module; this is the shape of it.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 820 380" role="img" aria-label="Code layers">
+          <rect x="20" y="20" width="780" height="62" rx="10" class="d-accent"/>
+          <text x="36" y="46" class="d-text" font-weight="700">Entry points and orchestration</text>
+          <text x="36" y="68" class="d-muted">cli.py · campaign.py · glaze_campaign.py · controller.py · nodal_run.py · coupled_exposure.py · hpc.py</text>
+          <rect x="20" y="96" width="250" height="140" rx="10" class="d-box"/>
+          <text x="34" y="120" class="d-text" font-weight="700">Air and droplets</text>
+          <text x="34" y="144" class="d-muted">su2.py · fields.py</text>
+          <text x="34" y="164" class="d-muted">aerodynamics.py · roughness.py</text>
+          <text x="34" y="184" class="d-muted">droplets.py · droplet_execution.py</text>
+          <text x="34" y="204" class="d-muted">collection_refinement.py</text>
+          <text x="34" y="224" class="d-muted">su2_warm_start.py</text>
+          <rect x="285" y="96" width="250" height="140" rx="10" class="d-warm"/>
+          <text x="299" y="120" class="d-text" font-weight="700">Water, heat and phase</text>
+          <text x="299" y="144" class="d-muted">thermo.py · film_*.py</text>
+          <text x="299" y="164" class="d-muted">nodal_coupling / nodal_phase</text>
+          <text x="299" y="184" class="d-muted">solid_fem.py · enthalpy_*.py</text>
+          <text x="299" y="204" class="d-muted">phase_*.py · melt_*.py</text>
+          <text x="299" y="224" class="d-muted">runback_exits.py · frosting/</text>
+          <rect x="550" y="96" width="250" height="140" rx="10" class="d-ok"/>
+          <text x="564" y="120" class="d-text" font-weight="700">Geometry and meshes</text>
+          <text x="564" y="144" class="d-muted">geometry.py · mesh.py</text>
+          <text x="564" y="164" class="d-muted">nodal_growth.py · front_merging.py</text>
+          <text x="564" y="184" class="d-muted">wall_refinement.py · fluid_remesh.py</text>
+          <text x="564" y="204" class="d-muted">mesh_adaptation.py · solid_remap.py</text>
+          <text x="564" y="224" class="d-muted">ice_mesh_quality.py</text>
+          <rect x="20" y="250" width="780" height="56" rx="10" class="d-box"/>
+          <text x="36" y="274" class="d-text" font-weight="700">State, inventories and checkpoints</text>
+          <text x="36" y="294" class="d-muted">material_inventory.py · *_checkpoint.py · integrity.py · thermal_state.py — every conserved quantity has a ledger</text>
+          <rect x="20" y="318" width="780" height="50" rx="10" class="d-box" stroke-dasharray="5 4"/>
+          <text x="36" y="342" class="d-text" font-weight="700">Outside the package</text>
+          <text x="36" y="360" class="d-muted">tests/ (unit tests) · tools/ (verification and run-preparation scripts) · hpc/nibi/ (cluster) · docs/ (models, reviews)</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 5.</b> Layers of the code. The orchestrators call the three physics groups in
+          the order of Figure 2. All of them read and write the conserved state through inventories and
+          checkpoints, so a run can stop and resume without losing or inventing mass or energy.</figcaption>
+      </figure>
+
+      <p>The rime shot loop in <code>icing/campaign.py</code> shows the six steps almost literally. Here it is,
+        trimmed to its core:</p>
+<pre><code class="language-python">for index, duration in enumerate(c.schedule, 1):
+    folder = out / f'shot_{index:02d}'
+    end = start + duration
+    if not _done(folder):                                   # resume: skip sealed shots
+        if index &gt; 1:                                       # map last flow onto the new mesh
+            run_warm_start(prev / 'flow' / 'restart_flow.dat', ..., mesh_path, folder / 'warm')
+        run_cfd(mesh, seed, folder / 'flow', c, site, timings, first_order)      # step 1
+        run_collection(mesh, folder / 'flow', folder / 'collect', c, site, timings)  # step 2
+        run_ice(load_state(solid_path), mesh, folder / 'flow', folder / 'collect',
+                folder / 'ice', c, start, end, timings, smoothing)              # steps 3-5
+        run_adaptation(mesh, folder / 'ice' / 'solid.json', folder / 'flow',
+                       folder / 'adapt', c, site, timings)                     # step 6
+        _seal(folder, ['flow/done.json', 'collect/done.json',
+                       'ice/done.json', 'adapt/done.json'], ...)              # commit the shot
+    mesh_path, solid_path = folder / 'adapt' / 'mesh.su2', folder / 'adapt' / 'solid.json'
+    start = end
+</code></pre>
+      <div class="code-src">icing/campaign.py, run_campaign() (simplified)</div>
+      <p>Each stage writes into its own folder and finishes by writing a <code>done.json</code> "seal" that
+        records hashes of its outputs. If the job is killed, rerunning the same command skips every sealed
+        stage and continues from the first unsealed one. The glaze loop,
+        <code>glaze_campaign.run_glaze_shots()</code>, has the same shape with <code>run_glaze_ice</code> and
+        <code>run_glaze_adaptation</code> in place of the rime stages.</p>
+
+      <h2 id="principles">Design rules that run through the code <span class="level advanced">Advanced</span></h2>
+      <p>A few rules show up in almost every module. Knowing them makes the code much easier to read.</p>
+      <ul>
+        <li><strong>Physical units everywhere.</strong> The mesh is in metres with real air viscosity. Scaling
+          the geometry and fudging viscosity to compensate would change the droplet Stokes number and the heat
+          transfer, so it is not allowed (<code>docs/MODELS.md</code>).</li>
+        <li><strong>Conservation is audited, not assumed.</strong> Water and energy each have a ledger:
+          impinged = ice + film + evaporated + runoff, checked at every step and again on restart. Mesh changes
+          use conservative transfer (overlap integrals), not plain interpolation.</li>
+        <li><strong>Fail loudly instead of guessing.</strong> An unresolved droplet trajectory, a warm film on
+          ice where melting is not modelled, a folded mesh cell, unknown keys in a case file: each raises an
+          error rather than being quietly patched. Defaults never stand in for missing physics.</li>
+        <li><strong>Transactional state.</strong> Checkpoints are replaced atomically only after a stage is
+          accepted. Failed attempts are kept for diagnosis. Restart checks hashes of inputs, code and library
+          versions, so a changed model forces a new run rather than mixing models.</li>
+        <li><strong>Verified ≠ validated.</strong> Passing a conservation check or an analytical test shows
+          the equations are solved correctly. It does not show they are the right equations. The project
+          keeps these separate (<code>docs/PHYSICS_REVIEW.md</code>).</li>
+      </ul>
+
+      <h2 id="path">Where to go next</h2>
+      <p>If icing is new to you, read <a href="basics.html">Icing physics in plain words</a> next. If you know
+        the physics and want the solver, start at <a href="airflow.html">Airflow with SU2</a> and follow the
+        loop. Each page starts simple and ends at the code.</p>
+      <div class="cards">
+        <a class="card" href="basics.html"><div class="card-num">2</div><h3>Icing physics</h3><p>Rime, glaze, LWC, collection efficiency, freezing fraction.</p></a>
+        <a class="card" href="airflow.html"><div class="card-num">3</div><h3>Airflow</h3><p>SU2 set-up, convergence gates, HTC, warm starts.</p></a>
+        <a class="card" href="mesh.html"><div class="card-num">9</div><h3>Meshes</h3><p>Before/after views of refinement and remeshing.</p></a>
+        <a class="card" href="campaign.html"><div class="card-num">11</div><h3>Campaigns</h3><p>Running, resuming and the cluster.</p></a>
+      </div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refining, deforming, remeshing · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 9 · Refining, deforming, remeshing</div>
+      <h1>Refining, deforming, remeshing</h1>
+      <p class="lede">After each shot the ice wall has moved by up to millimetres. Before the next CFD solution the solver must give the wall enough points, then fit the air mesh to the new wall, either by bending the old mesh or by building a new one, and finally carry the old flow solution across. This page shows each of these operations on real meshes from the RG-15 campaigns.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#why">Why the mesh must follow the ice</a> <span class="level basic">Basic</span></li>
+          <li><a href="#quality">How mesh quality is measured</a> <span class="level basic">Basic</span></li>
+          <li><a href="#refine">Wall refinement</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#cavity">Re-triangulating the ice under the split panels</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#deform">Deforming the fluid mesh with SU2_DEF</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#remesh">Remeshing with explicit wall layers</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#decide">Deform or remesh?</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#warm">Carrying the flow across: warm starts</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#lessons">Lessons from the seven-shot campaign</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#failure">Failure policy and known limits</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#shot6">Case study: the shot-6 cavity fix</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#code">Where it lives</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="why">Why the mesh must follow the ice <span class="level basic">Basic</span></h2>
+      <p>The flow solver SU2 (see <a href="airflow.html">Airflow with SU2</a>) solves on a <b>fluid mesh</b>: a set of small cells covering the air around the airfoil. Next to the wall the cells are very thin, stacked layers, because the velocity changes from zero at the wall to nearly free-stream speed within a fraction of a millimetre (the <b>boundary layer</b>). Heat transfer and shear, which drive freezing, are computed from these first few cells.</p>
+      <p>When ice grows, the wall moves into the air. Figure 1 shows how far: by the end of shot 6 of the RG-15 rime campaign (<code>runs/nibi/ms_rg15c</code>) the ice tip lay 1.73 mm upstream of the wall that the shot-6 mesh was built on. The whole near-wall layer stack of that mesh, and a band of core triangles, now lies inside the ice.</p>
+      <figure>
+        <div class="frame"><img src="figures/mesh_why_follow.png" alt="Shot-6 CFD mesh near the RG-15 rime ice tip with the 1030 s ice wall overlaid, inside the old cells"></div>
+        <figcaption><b>Figure 1.</b> The RG-15 rime shot-6 CFD mesh (<code>package/results/shot_06/flow/mesh.su2</code>, 437,273 cells) built on the 830 s wall (grey line and grey fill), with the ice wall after shot 6 at 1030 s (blue). Call-out 1: the new ice tip, 1.73 mm from the nearest old wall vertex. The fine quadrilateral layers that resolve the boundary layer are all inside the new ice; the CFD of shot 7 needs a mesh whose first cells sit on the blue line.</figcaption>
+      </figure>
+      <p>So between shots the solver runs a short pipeline, implemented for the rime path in <code>nodal_coupling._adapt_meshes</code> and for the glaze campaign in <code>glaze_campaign.py</code> (documented in <code>docs/MESH_ADAPTATION.md</code>):</p>
+      <ol class="steps">
+        <li><b>Refine the wall</b> where panels have become too long, without changing its shape.</li>
+        <li><b>Update the fluid mesh</b>: deform the old mesh if that keeps it good enough, otherwise remesh.</li>
+        <li><b>Map the old flow solution</b> onto the new mesh as a starting guess for the next CFD run.</li>
+      </ol>
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>The air mesh is a tailored suit for the airfoil. When ice grows, the suit no longer fits. The solver first adds seams to the wall where it has stretched, then either stretches the old suit over the new shape or sews a new one, and checks the fit before the flow is solved again.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="quality">How mesh quality is measured <span class="level basic">Basic</span></h2>
+      <p>Every mesh the solver produces or accepts goes through <code>Mesh.require_valid()</code> in <code>icing/mesh.py</code>. The measures are simple geometry, computed per cell by <code>Mesh.cell_metrics()</code>:</p>
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 760 230" role="img" aria-label="Mesh quality measures: signed area, corner sine, aspect ratio and first-cell height">
+            <polygon class="d-accent" points="30,180 170,180 190,80 50,90"/>
+            <text class="d-text" x="40" y="210">signed area &gt; 0</text>
+            <text class="d-muted" x="40" y="70">vertices counter-clockwise</text>
+            <path d="M 170 180 L 150 180 A 20 20 0 0 1 174 161" style="fill:none;stroke:var(--warm);stroke-width:2"/>
+            <text class="d-muted" x="120" y="160">corner</text>
+            <polygon class="d-warm" points="250,180 400,180 330,168"/>
+            <text class="d-text" x="250" y="210">corner sine (scaled Jacobian)</text>
+            <text class="d-muted" x="250" y="150">sin of the worst corner; 1 = right</text>
+            <text class="d-muted" x="250" y="132">angle, 0 = collapsed sliver</text>
+            <rect class="d-ok" x="460" y="150" width="140" height="30"/>
+            <line x1="460" y1="180" x2="600" y2="180" style="stroke:var(--accent);stroke-width:4"/>
+            <text class="d-muted" x="470" y="200">wall panel, length L</text>
+            <line class="d-line" x1="615" y1="150" x2="615" y2="180"/>
+            <text class="d-text" x="622" y="170">h₁ = A / L</text>
+            <text class="d-muted" x="622" y="190">(2A / L for a triangle)</text>
+            <text class="d-text" x="460" y="80">first-cell height h₁ and y⁺</text>
+            <text class="d-muted" x="460" y="102">y⁺ = ρ u_τ h₁ / μ ,  u_τ = √(τ_w/ρ)</text>
+            <text class="d-muted" x="460" y="124">aspect = longest / shortest edge</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 2.</b> The quality measures used by <code>icing/mesh.py</code> and <code>icing/fluid_remesh.py</code>.</figcaption>
+      </figure>
+      <ul>
+        <li><b>Signed area.</b> A cell whose vertices are not counter-clockwise has negative area: it is inverted. Any such cell (or a zero corner) is counted as invalid and the mesh is rejected.</li>
+        <li><b>Corner sine</b>, also called the <b>scaled Jacobian</b>: the cross product of two adjacent edges divided by their lengths, i.e. the sine of the corner angle, minimised over the cell's corners. The hard floor is <code>MIN_CORNER_SINE = 0.10</code> (a corner of about 5.7°). For a deformed mesh the ratio to the same cell before deformation must also stay above <code>MIN_CORNER_RATIO = 0.25</code> and the area ratio above 0.05: "The per-cell ratio catches a sudden loss even if a different cell sets the minimum."</li>
+        <li><b>Edge aspect ratio</b>: longest edge over shortest edge of a cell. Near-wall cells are deliberately long and thin; the number is reported, not limited.</li>
+        <li><b>First-cell height</b> \(h_1\) of each wall panel: the area of the cell on that panel divided by the panel length (twice that for a triangle), in <code>fluid_remesh.wall_layer_metrics()</code>.</li>
+        <li><b>y⁺</b>, the first-cell height in "wall units": \(y^+ = \rho\,u_\tau h_1/\mu\), with the friction velocity \(u_\tau = \sqrt{\tau_w/\rho}\) from the latest wall shear stress \(\tau_w\), density \(\rho\) and dynamic viscosity \(\mu\) (<code>mesh_adaptation.predicted_yplus</code>). The SST turbulence model used here wants \(y^+\) of about 1.</li>
+        <li><b>Topology</b> (<code>Mesh.topology()</code>): every interior edge is shared by exactly two cells in opposite directions, every boundary edge carries exactly one marker, and no marked edge is interior. Positive cell areas alone cannot detect duplicate cells or hanging edges.</li>
+      </ul>
+<pre><code class="language-python">areas[indices] = .5 * cross(points - points[:, :1], edges).sum(axis=1)
+corners = cross(edges, np.roll(edges, -1, axis=1))
+scales = np.maximum(lengths * np.roll(lengths, -1, axis=1), 1e-300)
+jac[indices] = (corners / scales).min(axis=1)          # worst corner sine of the cell
+aspect[indices] = lengths.max(axis=1) / np.maximum(lengths.min(axis=1), 1e-300)
+</code></pre>
+      <div class="code-src">icing/mesh.py, Mesh.cell_metrics() (simplified)</div>
+      <p>The ice body has its own mesh, the triangular conduction mesh of <a href="solid.html">Heat inside the ice</a>. Its quality matters for a different reason: for linear triangles the conductance of an interior edge is \((k/2)(\cot a + \cot b)\), where \(a\) and \(b\) are the two angles facing the edge, and it turns negative when \(a+b > 180^\circ\). <code>icing/ice_mesh_quality.py</code> therefore keeps the ice "locally Delaunay" after every geometry step by edge flips and removal of buried vertices (<code>restore_ice_shape</code>), conserving water mass and enthalpy; <code>ice_quality()</code> reports the largest angle and the number of non-Delaunay edges.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="refine">Wall refinement <span class="level intermediate">Intermediate</span></h2>
+      <p>As the <a href="growth.html#facets">previous page</a> showed, a wall that keeps its vertices turns into facets. Refinement adds vertices. It has two parts: deciding how long each panel <i>should</i> be, and splitting the ones that are too long.</p>
+      <h3>The target spacing</h3>
+      <p><code>wall_resolution.target_spacing()</code> gives every panel a target length, the minimum of two limits:</p>
+      <ul>
+        <li><b>Design spacing</b>: the panel length of the clean wall at the nearest substrate point, times <code>design_factor</code> (1.0). This keeps the mesh designer's intent, e.g. fine panels at the leading edge.</li>
+        <li><b>Curvature limit</b>: at most <code>max_turn_deg</code> (5°) of turning per panel, using a curvature smoothed over <code>curvature_window</code> (4) design spacings, so that a true corner gets a finite density. Vertices turning more than <code>feature_angle_deg</code> (60°), such as a blunt trailing edge, are treated as features, not curvature.</li>
+      </ul>
+      <p>The result is then <b>graded</b>: neighbouring targets may differ by at most a growth rate of <code>grading</code> − 1 = 0.2 per unit distance (<code>grade()</code>). The curvature limit is applied only on iced panels; "The clean substrate keeps the designer's spacing; only ice is adapted."</p>
+      <h3>Exact splitting</h3>
+      <p>Any panel longer than <code>split_ratio</code> (1.5) × its target is cut into equal pieces, repeated up to six passes (<code>adapt_surface</code>). The new vertices lie <i>exactly</i> on the old panels, so the polygon, its enclosed area and all inventories are unchanged:</p>
+<pre><code class="language-python">pieces = np.where(lengths &gt; split_ratio*panel_target, np.ceil(lengths/panel_target), 1).astype(int)
+for i, count in enumerate(pieces):
+    a = surface.points[i]; edge = surface.edges[i]
+    for k in range(count):
+        # Exact endpoints: the first point is the original vertex itself.
+        points.append(a if k == 0 else a + (k/count)*edge)
+        parent.append(i); start.append(k/count); stop.append((k+1)/count)
+</code></pre>
+      <div class="code-src">icing/wall_resolution.py, refine_wall() (simplified)</div>
+      <p>The <code>parent</code>, <code>start</code> and <code>stop</code> arrays remember which old panel each new panel came from and which fraction of it, so every panel quantity can be moved across conservatively (<code>Refinement.panel_operator</code>), and outlet panels and panel lineage follow the wall. Panels under ice thinner than <code>THIN_ICE_FRACTION</code> = 0.25 × target are excluded ("it cannot have stretched the panel, and a cavity under it would be a sliver").</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_wall_refinement.png" alt="RG-15 rime wall at 1030 s with 103 inserted vertices and panel length over target before and after refinement"></div>
+        <figcaption><b>Figure 3.</b> The shot-6 refinement of the RG-15 rime wall at 1030 s (offline replay <code>runs/nibi/ms_rg15c/diagnosis/fixed_replay_wsl</code>). Top left: the 773 old vertices (dark) and the 103 inserted ones (orange), 773 → 876 vertices on 73 split panels. Top right: the longest eligible panel, 163 µm long and 4.45 × its 37 µm target, cut into 5 equal pieces. Bottom: panel length over target for the iced panels of the front 30 mm, before and after; after refinement the largest is 1.49, below the split ratio. Computed by <code>_build/fig_mesh.py</code> with <code>wall_resolution.target_spacing</code> and the campaign's settings.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="cavity">Re-triangulating the ice under the split panels <span class="level intermediate">Intermediate</span></h2>
+      <p>The wall is also the outer boundary of the ice conduction mesh. A new wall vertex on an old panel would be a "hanging node" for the triangle that owns that panel. So the solid mesh must change too, but as little as possible. <code>wall_refinement.refine_nodal_wall()</code> does this:</p>
+      <ol class="steps">
+        <li><b>Select a shallow cavity</b> (<code>select_cavity</code>): the ice triangles within <code>depth_factor</code> (2) × the new panel length of the split panels, plus (since 2026-11-17) the triangle owning every split panel; pinched corners are closed.</li>
+        <li><b>Re-triangulate it with Gmsh</b> (<code>remesh_cavity</code>): every vertex on the cavity boundary and every interior material interface stays fixed, and the new wall vertices are added on the split edges. Everything outside the cavity, including the whole substrate, is kept exactly.</li>
+        <li><b>Transfer temperature</b> (<code>_cavity_transfer</code>): a positive, capacity-weighted overlap projection inside the cavity plus the exact retained energy at shared nodes. The code checks that energy is conserved to \(10^{-9}\) relative and that no temperature leaves the old range.</li>
+        <li><b>Split the layered ice history</b> column by column at the same fractions through every growth layer (<code>refine_layered_inventory</code>), and remap the film by dual-length overlap (<code>_dual_remap</code>).</li>
+        <li><b>Audit</b>: total mass to \(10^{-12}\) and energy to \(10^{-9}\) relative, the full checkpoint validation, and the resolution requirement (no eligible panel above <code>max_length_ratio</code> = 2.5 × target).</li>
+      </ol>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_cavity_before_after.png" alt="Solid ice mesh near the RG-15 rime tip before and after the cavity re-triangulation"></div>
+        <figcaption><b>Figure 4.</b> The ice conduction mesh at the RG-15 rime tip, shot-6 refinement (old state <code>package/results/shot_06/ice/solid.json</code>, new state <code>diagnosis/fixed_replay_wsl/adapt/solid.json</code>). Left: the cavity (orange) is the thin band of growth-layer triangles under the split panels; each promoted layer left a row of long, thin triangles. Right: Gmsh replaced the 11,427 cavity triangles with 4,632 better-shaped ones that include the new wall vertices (orange dots). Grey triangles are identical in both meshes. Recorded in <code>wall_refinement_00.json</code>: 1.14 s of Gmsh, 104 s in total, energy residual 7.3 × 10⁻¹¹ J/m.</figcaption>
+      </figure>
+      <p>The glaze path uses the same rules on its coupled thermal history (<code>icing/coupled_wall_refinement.py</code>): the ice under the split panels is re-triangulated by <code>coupled_solid_remesh</code>, and the phase columns (water, ice and film stacked on each wall vertex) are divided among the new dual cells by arclength overlap. The module docstring names the cost: "a split therefore spreads a column sideways by at most half a panel: first-order horizontal smoothing of the film, no change of total water or energy." If a glaze refinement cannot be meshed or verified, the state is returned unchanged and the shortfall is reported.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="deform">Deforming the fluid mesh with SU2_DEF <span class="level intermediate">Intermediate</span></h2>
+      <p>The cheaper update keeps the old mesh and moves its nodes. SU2's mesh-deformation tool, <b>SU2_DEF</b>, is given the new wall positions and moves the interior nodes smoothly. Two methods are configured: <b>RBF</b> (radial basis functions; the interior displacement is an interpolation of the wall displacement with compact Wendland C2 functions, support radius 0.6 m in the rime campaign's <code>deform.cfg</code>) and <b>ELASTIC</b> (the mesh is treated as an elastic solid with stiffness growing near the wall). Deformation keeps every node, cell and marker, so values in a flow solution "travel with their nodes".</p>
+      <p>A deformed candidate is first checked for topology and wall position. <code>deformed_wall._canonical_deformed_wall()</code> rejects any change of cells or markers and any wall node further than floating-point roundoff (64 machine epsilons × the geometry scale) from the ice wall, then snaps the wall nodes to the exact ice coordinates. Then come the quality checks of <code>mesh_adaptation.deformation_checks()</code>:</p>
+<pre><code class="language-python">yplus = predicted_yplus(heights, shear, flow)
+if yplus.max() &gt; adaptation.max_yplus_ratio*target:                       # 2 x target
+    reasons.append(f'predicted y+ {yplus.max():.3g} &gt; ...')
+if active.any() and np.median(yplus[active]) &lt; adaptation.min_yplus_ratio*target:   # 0.1 x
+    reasons.append('median predicted y+ ... far below target')
+if metrics['wall_cell_min_scaled_jacobian'] &lt; adaptation.min_wall_jacobian:          # 0.3
+    reasons.append('wall cell scaled Jacobian ...')
+if quality['min_scaled_jacobian'] &lt; adaptation.min_corner_sine:                      # 0.2
+    reasons.append('minimum corner sine ...')
+drift = np.maximum(heights/previous, previous/heights)
+if drift.max() &gt; adaptation.max_height_drift:                                        # 1.5
+    reasons.append(f'first-cell height drift {drift.max():.3g}')
+</code></pre>
+      <div class="code-src">icing/mesh_adaptation.py, deformation_checks() (simplified; defaults from MeshAdaptation)</div>
+      <p>Figure 5 shows a real rejection. At the end of shot 3 of the rime campaign (430 s), SU2_DEF produced an RBF and an ELASTIC candidate from the shot-3 CFD mesh. The record <code>shot_03/adapt/quality.json</code> lists the verdicts: RBF failed with "minimum corner sine 0.146" and "first-cell height drift 1.79"; ELASTIC with "first-cell height drift 1.8".</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_deform_checks.png" alt="First-cell height drift along the wall for RBF and ELASTIC deformation candidates, and the worst RBF cell"></div>
+        <figcaption><b>Figure 5.</b> The two rejected SU2_DEF candidates of rime shot 3 (extracted from the ms_rg15c return archive). Left: per wall panel, how much the first-cell height changed against the previous mesh; both exceed the 1.5 limit near panel 663, at the upper nose. Right: the worst RBF cell (filled), a triangle beyond the layers squeezed to a corner sine of 0.146 (grey: the mesh before deformation). Recomputed here with <code>fluid_remesh.wall_layer_metrics</code> and <code>Mesh.quality</code>; the values match the recorded 1.787, 1.802 and 0.146.</figcaption>
+      </figure>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_deform_vs_remesh.png" alt="Near-wall cells of the rejected RBF candidate and the accepted remesh at the same panel"></div>
+        <figcaption><b>Figure 6.</b> The same wall location (call-out 1, panel 663 at x = −3.0 mm) in the rejected RBF candidate and in the mesh that was used instead. RBF squeezed the first cell from 3.14 µm to 1.76 µm, while ELASTIC stretched it to 5.08 µm; the explicit-layer remesh puts it back at 2.91 µm, the height for y⁺ = 1 from the shot-3 wall shear. Note also the irregular layer spacing and the bent core triangles on the left against the smooth grading on the right.</figcaption>
+      </figure>
+      <p>Deformation is not always rejected. In shot 1 of the same campaign the RBF candidate passed every check (record <code>shot_01/adapt/quality.json</code>): predicted y⁺ at most 1.79, height drift 1.17, minimum corner sine 0.298; SU2_DEF took 12.2 s. The glaze case 3.2 run also deformed after shot 1 and remeshed after every later shot.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="remesh">Remeshing with explicit wall layers <span class="level intermediate">Intermediate</span></h2>
+      <p>The alternative is a new mesh, built by <code>fluid_remesh.remesh_fluid()</code>. It has three parts.</p>
+      <h3>1. The wall is kept exactly</h3>
+      <p>Every wall vertex, in order, becomes ring 0 of the new mesh, and the nodes are numbered wall first. After assembly <code>_check_wall</code> verifies that the new mesh reproduces the input wall exactly, and <code>deformed_wall._canonical_remeshed_wall</code> removes only file roundoff (Gmsh writes about 16 significant digits).</p>
+      <h3>2. Explicit quadrilateral layers</h3>
+      <p>The near-wall layers are not left to Gmsh ("Gmsh's own BoundaryLayer field is not used: on iced walls it produced self-intersecting 1D meshes ('Edge not recovered') in this project"). Instead <code>explicit_layers()</code> offsets copies of the wall polygon outward, ring by ring. The first height comes from the target y⁺ and the <i>largest</i> latest wall shear:</p>
+      $$h_1 = \frac{y^+_\text{target}\,\mu}{\rho\,u_\tau},\qquad u_\tau = \sqrt{\max|\tau_w|/\rho},$$
+      <p>clamped to [0.1 µm, 100 µm] (<code>first_height_for_yplus</code>). Layers then grow geometrically, by at most <code>growth</code> = 1.2 per layer, until the outermost layer is about <code>transition_aspect</code> (1.0) times the local wall spacing, so the hand-over to the triangular core is at aspect ratio about one. Where offsets would collide the stack is limited: a cap at concave turns, a share of at most <code>GAP_FRACTION</code> = 0.3 of the gap where another part of the wall faces the vertex, a smoothness limit between neighbours, and a final loop that thins the layers at any vertex whose ring still meets itself until every ring is a simple polygon.</p>
+<pre><code class="language-python">layers = 2
+while layers &lt; settings.max_layers and first_height*settings.growth**(layers-1) &lt; desired_top.max():
+    layers += 1
+cap = np.where(rate &lt; 0, .35*lengths/np.maximum(-rate, 1e-30), np.inf)      # concave turns
+clearance = _facing_clearance(surface, direction)                            # facing walls
+thickness = np.minimum(np.minimum(desired, cap), GAP_FRACTION*clearance)
+...
+while True:
+    thickness, ratio, thin, rings = build(thickness)
+    offenders = _ring_conflicts(rings)
+    if not len(offenders):
+        break
+    thickness = thickness.copy(); thickness[offenders] *= .7               # thin only where rings meet
+</code></pre>
+      <div class="code-src">icing/fluid_remesh.py, explicit_layers() (simplified)</div>
+      <h3>3. A Gmsh core inside the original outer boundary</h3>
+      <p>Gmsh fills the region between the outermost layer ring and all original non-wall boundaries (tunnel walls, inlet, outlet) with Frontal-Delaunay triangles (<code>Mesh.Algorithm = 6</code>). The ring is fixed vertex for vertex, every outer marker name is kept, and the size grows from the ring spacing at a bounded rate (<code>core_growth</code> 1.2). Extra size fields refine the trailing edge and a one-chord near wake (<code>_core_refinement</code>, <code>_refinement_fields</code>). The core and the layers are then assembled into one SU2 mesh and must pass <code>require_valid()</code>.</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_remesh_before_after.png" alt="Shot-6 CFD mesh at the RG-15 rime nose before and the explicit-layer remesh after"></div>
+        <figcaption><b>Figure 7.</b> Before and after at the RG-15 rime nose, end of shot 6. Left: the shot-6 CFD mesh, built on the 830 s wall (call-out 1); the 1030 s ice (blue dashes) lies 1.7 mm upstream, among the core triangles. Right: the offline replay's remesh on the refined 876-vertex wall (<code>diagnosis/fixed_replay_wsl/adapt/mesh.su2</code>). Call-out 2: the wall, kept exactly; the first layer at the tip is 3.30 µm thick. Call-out 3: the outermost of the 33 layers, 0.74 mm from the wall at the tip, where the quads hand over to triangles of similar size. Call-out 4: the Gmsh core, growing coarser away from the ring.</figcaption>
+      </figure>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_layers_zoom.png" alt="Zoom chain from the nose to the first wall cells of the remeshed fluid mesh, and the layer heights at one vertex"></div>
+        <figcaption><b>Figure 8.</b> Zooming into the same remesh (each orange box is the next panel). From left: the layer band (blue quads) and the core (beige triangles) at the nose; a 0.5 mm window on the upper flank; a 44 µm window where the first cells, 3.3 µm high, become visible against the wall (call-out 1). Right: the 33 layer heights above vertex 1, growing by about 1.09 per layer from 3.30 µm to 58 µm. Here the stack was capped below its target (the local wall spacing, 199 µm, dashed): 532 of the 876 wall vertices were capped in this remesh, so the hand-over to the core happens at an aspect ratio above one at those vertices. Mesh totals (<code>quality.json</code>): 243,933 nodes, 456,270 cells, no invalid cells, minimum corner sine 0.290, largest edge aspect 316, first heights 0.20 / 3.30 / 3.39 µm (min / median / max; the minimum is at thinned vertices).</figcaption>
+      </figure>
+      <div class="callout why"><div class="callout-title">Why explicit layers</div>
+        <p>The layers control the one number the CFD is most sensitive to near the wall, \(h_1\), directly from the latest shear, instead of letting it drift with deformation. The 2026-11-07 audit (next sections) found deformed meshes whose first-cell height had grown from 54 to 334 µm at the nose, and an earlier rebuild with fixed 0.5 µm layers that gave aspect ratios up to 5,950.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="decide">Deform or remesh? <span class="level intermediate">Intermediate</span></h2>
+      <p>The choice is made by <code>mesh_adaptation.update_fluid_mesh()</code>. Deformation cannot add vertices, so a wall that gained or lost vertices (refinement or merging) is always remeshed. Otherwise the configured SU2_DEF methods are tried in order and the first candidate that passes all checks is kept; if none passes, the solver remeshes. <code>prefer</code> = <code>REMESH</code> or <code>DEFORM</code> forces one side.</p>
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 760 420" role="img" aria-label="Flowchart of the deform-or-remesh decision in update_fluid_mesh">
+            <defs><marker id="ma" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <rect class="d-box" x="250" y="10" width="260" height="46" rx="8"/><text class="d-text" x="380" y="38" text-anchor="middle">new ice wall after the shot</text>
+            <rect class="d-accent" x="230" y="80" width="300" height="50" rx="8"/><text class="d-text" x="380" y="102" text-anchor="middle">refine the wall if needed</text><text class="d-muted" x="380" y="120" text-anchor="middle">panel &gt; 1.5 × target (deferred unless remeshing)</text>
+            <rect class="d-warm" x="230" y="155" width="300" height="46" rx="8"/><text class="d-text" x="380" y="183" text-anchor="middle">wall vertex count changed?</text>
+            <rect class="d-accent" x="20" y="240" width="300" height="56" rx="8"/><text class="d-text" x="170" y="263" text-anchor="middle">SU2_DEF: RBF, then ELASTIC</text><text class="d-muted" x="170" y="283" text-anchor="middle">exact wall, require_valid, y⁺, Jacobian, drift</text>
+            <rect class="d-ok" x="20" y="340" width="300" height="56" rx="8"/><text class="d-text" x="170" y="365" text-anchor="middle">DEFORM accepted</text><text class="d-muted" x="170" y="384" text-anchor="middle">values travel with the nodes</text>
+            <rect class="d-ok" x="440" y="300" width="300" height="70" rx="8"/><text class="d-text" x="590" y="325" text-anchor="middle">REMESH</text><text class="d-muted" x="590" y="345" text-anchor="middle">exact wall + explicit layers + Gmsh core</text><text class="d-muted" x="590" y="362" text-anchor="middle">fixed outer boundary</text>
+            <line class="d-arrow" x1="380" y1="56" x2="380" y2="76" marker-end="url(#ma)"/>
+            <line class="d-arrow" x1="380" y1="130" x2="380" y2="151" marker-end="url(#ma)"/>
+            <line class="d-arrow" x1="300" y1="201" x2="200" y2="236" marker-end="url(#ma)"/><text class="d-muted" x="200" y="222">no</text>
+            <line class="d-arrow" x1="460" y1="201" x2="570" y2="296" marker-end="url(#ma)"/><text class="d-muted" x="530" y="240">yes</text>
+            <line class="d-arrow" x1="170" y1="296" x2="170" y2="336" marker-end="url(#ma)"/><text class="d-muted" x="180" y="322">a candidate passes</text>
+            <line class="d-arrow" x1="320" y1="270" x2="436" y2="320" marker-end="url(#ma)"/><text class="d-muted" x="350" y="322">none passes</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 9.</b> The decision in <code>update_fluid_mesh</code>. A <code>LaunchFailure</code> (the scheduler started no task) or an exhausted wall-time is re-raised and never counts as a failed method, so an infrastructure fault cannot change the numerical path.</figcaption>
+      </figure>
+<pre><code class="language-python">if not wall_changed and adaptation.prefer != 'REMESH':
+    for index, method in enumerate(deformation_methods):
+        try:
+            candidate, reported = backend.deform(mesh, surface, root/f'deform_{index}_{method}', method, radius)
+            candidate, roundoff = _canonical_deformed_wall(candidate, surface, mesh)
+            quality = candidate.require_valid(mesh)
+            reasons, metrics = deformation_checks(candidate, mesh, surface, adaptation, shear, flow)
+            if reasons and adaptation.prefer != 'DEFORM':
+                attempts.append(dict(method=method, accepted=False, reasons=reasons, metrics=metrics))
+                continue
+            return candidate, quality
+        except LaunchFailure:
+            raise
+        except (ValueError, RuntimeError) as error:
+            attempts.append(dict(method=method, accepted=False, error=str(error)))
+first = target_first_height(adaptation, shear, flow)
+candidate, quality = remesh_fluid(mesh if outer_boundary is None else outer_boundary, surface,
+                                  root/'remesh', adaptation.remesh_settings, first_height=first)
+</code></pre>
+      <div class="code-src">icing/mesh_adaptation.py, update_fluid_mesh() (simplified)</div>
+      <p>The policy follows from measured costs (<code>docs/MESH_ADAPTATION.md</code>). Mesh generation is cheap: SU2_DEF RBF took 8–10 s per update on 107k nodes, a Gmsh core about 2 s, against hours of CFD per shot. What costs is CFD re-settling: every remesh "costs a re-settling period: residuals jump about three orders of magnitude and drag wobbles by about 10 %". Hence: deform whenever the deformed mesh passes the accuracy checks; do not remesh just to refine the wall (refinement beyond <code>split_ratio</code> is deferred unless a panel reaches the hard limit <code>max_length_ratio</code> = 2.5); and when remeshing anyway, refine at the same time.</p>
+      <p>What actually happened in the rime campaign <code>ms_rg15c</code> (per-shot <code>adapt/quality.json</code> from the return archive):</p>
+      <div class="table-wrap"><table>
+        <tr><th>End of shot</th><th>Decision</th><th>Why</th><th>Wall vertices</th><th>Fluid nodes</th><th>Min corner sine</th></tr>
+        <tr><td>1 (30 s)</td><td>DEFORM (RBF)</td><td>all checks passed; refinement deferred (max 2.49 × target)</td><td>666</td><td>187,171</td><td>0.298</td></tr>
+        <tr><td>2 (230 s)</td><td>REMESH</td><td>wall refined</td><td>666 → 691</td><td>231,486</td><td>0.377</td></tr>
+        <tr><td>3 (430 s)</td><td>REMESH</td><td>RBF and ELASTIC rejected, then wall refined</td><td>691 → 698</td><td>193,402</td><td>0.334</td></tr>
+        <tr><td>4 (630 s)</td><td>REMESH</td><td>wall refined</td><td>698 → 725</td><td>215,248</td><td>0.373</td></tr>
+        <tr><td>5 (830 s)</td><td>REMESH</td><td>wall refined</td><td>725 → 773</td><td>233,070</td><td>0.384</td></tr>
+        <tr><td>6 (1030 s), offline replay</td><td>REMESH</td><td>wall refined</td><td>773 → 876</td><td>243,933</td><td>0.290</td></tr>
+      </table></div>
+      <p>The glaze case 3.2 run <code>glz81_32</code> shows the same pattern: deformation after shot 1, then a remesh after every shot with refinement 890 → 913, 905 → 947, 929 → 996 and 956 → 1,067 vertices. The "before" count of each shot is lower than the previous "after" because pocket fills removed vertices during the shot.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="warm">Carrying the flow across: warm starts <span class="level advanced">Advanced</span></h2>
+      <p>A converged CFD solution from the previous shot is a much better starting point than free stream. <code>su2_warm_start.map_restart_to_mesh()</code> interpolates the previous SU2 binary restart onto any new mesh, deformed or remeshed. Away from the wall each new node takes the linear (or bilinear) interpolant of the old cell containing it. Near the wall that would be wrong: the wall moved outward by a gap \(g\) comparable to the boundary-layer thickness, so plain interpolation "would put the old mid-layer state at the new wall". The default <b>wall-relative</b> mapping instead lets a node at distance \(d\) from the new wall sample the old field at the same distance \(d\) from the old wall, with the velocity rotated by the change of wall normal, blending back to plain interpolation with the weight</p>
+      $$w = \operatorname{clip}\!\Big(\frac{4g-d}{2g},\,0,\,1\Big),$$
+      <p>which is 1 up to \(d = 2g\) and 0 beyond \(d = 4g\). On the new wall, velocity and turbulent kinetic energy are set to their no-slip values; nodes outside the old domain (receding ice) take the nearest old node and are counted.</p>
+<pre><code class="language-python">foot, distance, n_new = _wall_frame(new_wall, target.points)   # nearest point on the new wall
+old_foot, gap, _ = _wall_frame(old_wall, foot)                    # and on the old wall: the gap g
+weight = np.clip((4*gap - distance)/np.maximum(2*gap, 1e-300), 0., 1.)
+shifted, _ = sample(old_foot[near] + distance[near, None]*n_old[near])   # same distance from the old wall
+new[near, 2:] = w*shifted + (1 - w)*direct[near]
+</code></pre>
+      <div class="code-src">icing/su2_warm_start.py, map_restart_to_mesh() (simplified)</div>
+      <p>For the shot-6 replay the mapping report (<code>fixed_replay_wsl/warm_next/report.json</code>) shows 12,266 of 243,933 nodes mapped wall-relative, 31 nodes outside the old domain, and a largest wall gap of 1.75 mm. Capped SU2 probes of 1,500 iterations (integration checks, 2026-11-07) measured the value of the mapping on the 830 s → 1030 s shape change, as errors in wall heat flux against the converged shot-7 answer:</p>
+      <div class="table-wrap"><table>
+        <tr><th>Mapping</th><th>Integrated heat flux, it. 1</th><th>Nose heat flux, it. 1</th><th>Integrated, it. 1500</th><th>Nose, it. 1500</th></tr>
+        <tr><td>Plain interpolation</td><td>4452 %</td><td>22190 %</td><td>298 %</td><td>1442 %</td></tr>
+        <tr><td>Wall-relative (default)</td><td>4.9 %</td><td>28 %</td><td>5.8 %</td><td>29 %</td></tr>
+      </table></div>
+      <p>The document attributes the remaining error to "the genuine flow adjustment to the new ice shape, which costs iterations whichever mesh is used". A warm start only changes the initial guess; the same convergence gates decide acceptance, and a warm-started solve that fails its gates is retried once from a cold start.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="lessons">Lessons from the seven-shot campaign <span class="level advanced">Advanced</span></h2>
+      <p>Most of this page exists because of a read-only audit of the first RG-15 seven-shot rime campaign (<code>Validation/Review/rg15_final_1200s/REVIEW.md</code>, summarised in <code>docs/MESH_ADAPTATION.md</code>). Its mesh table:</p>
+      <div class="table-wrap"><table>
+        <tr><th>CFD mesh</th><th>Max nose panel (mm)</th><th>Max turn (°)</th><th>Nose first-cell height min / median / max (µm)</th><th>Min corner sine</th><th>y⁺ max</th></tr>
+        <tr><td>Shot 1 clean</td><td>1.035</td><td>10.2</td><td>46 / 54 / 59</td><td>0.760</td><td>11.7</td></tr>
+        <tr><td>Shot 3 RBF</td><td>1.036</td><td>13.7</td><td>53 / 83 / 115</td><td>0.707</td><td>17.8</td></tr>
+        <tr><td>Shot 5 RBF</td><td>1.585</td><td>24.6</td><td>56 / 97 / 244</td><td>0.327</td><td>73.2</td></tr>
+        <tr><td>Shot 6 RBF (original)</td><td>2.236</td><td>33.0</td><td>54 / 89 / 334</td><td>0.0136</td><td>88.3</td></tr>
+        <tr><td>Shot 7 rebuilt</td><td>3.127</td><td>37.2</td><td>0.5 / 0.5 / 0.53</td><td>0.154</td><td>0.12</td></tr>
+        <tr><td>Final 1200 s wall</td><td>4.026</td><td>75.6</td><td>–</td><td>–</td><td>–</td></tr>
+      </table></div>
+      <ol>
+        <li><b>The wall was never refined</b>: all shots kept the clean 666 vertices, and nose panels stretched 17×.</li>
+        <li><b>Deformation quietly degraded the near-wall mesh</b>: a large RBF radius (two chords) spread the nose motion into the trailing edge and wake, y⁺ rose shot by shot, and one wake cell collapsed to a corner sine of 0.0136, "which the area-only validator of that time accepted, and which corrupted the original shot 6". The corner-sine floor, the per-cell ratio and the y⁺/drift checks were the answer.</li>
+        <li><b>The repair over-corrected</b>: explicit 0.5 µm layers gave y⁺ ≈ 0.1 with aspect ratios up to 5,950; layers are now sized from y⁺ = 1 and hand over at aspect about one.</li>
+        <li><b>Remeshing lost warm starts</b>: the rebuilt shots needed cold starts of 330–370k iterations; hence the wall-relative mapping.</li>
+      </ol>
+
+      <!-- ============================================================ -->
+      <h2 id="failure">Failure policy and known limits <span class="level advanced">Advanced</span></h2>
+      <div class="table-wrap"><table>
+        <tr><th>Situation</th><th>Result</th></tr>
+        <tr><td>No panel over <code>split_ratio</code> × target</td><td>nothing to do</td></tr>
+        <tr><td>Over <code>split_ratio</code> but under <code>max_length_ratio</code>, and deformation is adequate</td><td>refinement deferred (recorded); saves a CFD re-settle</td></tr>
+        <tr><td>Ice thinner than 0.25 × target under a panel</td><td>excluded and reported</td></tr>
+        <tr><td>A requested refinement fails (Gmsh error, unclosable cavity, lost vertex)</td><td><code>WallRefinementError</code>: the step stops with the diagnostics folder</td></tr>
+        <tr><td>Any conservation, bounds or inventory audit fails</td><td><code>WallRefinementError</code></td></tr>
+        <tr><td>A panel still above <code>max_length_ratio</code> after refinement</td><td><code>WallRefinementError</code> (resolution requirement unmet)</td></tr>
+        <tr><td>A wall-point merge would fold cells or cannot be fed</td><td>that merge is skipped and recorded; the step continues</td></tr>
+        <tr><td>No deformation candidate passes and remeshing is disabled</td><td><code>RuntimeError</code> from <code>update_fluid_mesh</code>; the rime step loop (<code>nodal_coupling</code>) records any mesh-update failure other than <code>WallRefinementError</code> and retries the step with half the duration</td></tr>
+      </table></div>
+      <p>The table is from <code>docs/MESH_ADAPTATION.md</code>. <code>WallRefinementError</code> is deliberately not a reducible failure: "callers must not retry it by halving the growth step", because a failed refinement points at a geometry or code problem, not at a too-large step.</p>
+      <div class="callout limits"><div class="callout-title">Known limits</div>
+        <ul>
+          <li><b>Outer-boundary compounding.</b> <code>remesh_fluid</code> takes the outer boundary from the mesh it is given and may subdivide its edges, so remeshing a remesh refines the outer boundary again: in an RG-15 pilot, outer edges went 1,306 → 1,812 → 2,715 and nodes 107k → 210k → 305k. <code>update_fluid_mesh(outer_boundary=...)</code> fixes this, and <code>icing.campaign</code> passes the original tunnel mesh, but the <code>run-nodal</code> path still passes the current mesh.</li>
+          <li>Remeshing supports unstructured 2D triangle/quad meshes only.</li>
+          <li>Each remesh changes the discretisation. Grid sensitivity of heat transfer and collection on remeshed against deformed meshes is still a prospective user-run study; nothing here is a converged CFD validation.</li>
+          <li>The cavity temperature projection can smooth local gradients (<code>docs/SOLID_REMESH_TRANSFER.md</code>); it is conservative and bounded, not exact interpolation.</li>
+          <li>Layer stacks that are capped (Figure 8) hand over to the core at an aspect ratio above one; the effect on the CFD has not been studied separately.</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="shot6">Case study: the shot-6 cavity fix <span class="level advanced">Advanced</span></h2>
+      <p>The rime campaign <code>ms_rg15c</code> (Nibi job 27435271, commit 65ed532) reached 1030 s with 0.163189 kg/m of ice, then stopped in the solid wall refinement before shot 7. The physics review entry "2026-11-17 — RG-15 rime shot-6 solid refinement" explains: the triangle adjacent to split panel 670 reached 98.7 µm into the ice, beyond the 66.6 µm cavity depth. It was therefore not in the cavity, Gmsh received the original wall edge without the split point, and the conforming solid-boundary audit "correctly rejected the result".</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/mesh_cavity_fix.png" alt="The Nibi cavity without the requested split point and the fixed cavity including the owning triangle"></div>
+        <figcaption><b>Figure 10.</b> The panel where shot 6 failed (x ≈ 1.48 mm, y ≈ 3.65 mm). Dotted grey: the old ice triangles. Left: the cavity meshed on Nibi (<code>package/results/shot_06/adapt/wall_refinement_00/cavity.su2</code>) stops short of this panel; the requested split point (open circle) is missing. Of the 103 requested split points it is the only one not in that cavity. Right: the fixed cavity (<code>fixed_replay_wsl/adapt/wall_refinement_00/cavity.su2</code>) includes the long triangle that owns the panel, so the split point is on the boundary and the panel is replaced by its two child edges.</figcaption>
+      </figure>
+      <p>The fix is two lines in <code>select_cavity</code> plus a check before Gmsh runs:</p>
+<pre><code class="language-python">candidates = np.flatnonzero(np.all(near[tri], axis=1))
+candidates = candidates[_ice_mask(pts, tri[candidates], base)]
+region = set(candidates.tolist())
+region.update(wall_triangles)          # the triangle owning every split panel, however deep
+</code></pre>
+      <div class="code-src">icing/wall_refinement.py, select_cavity() (simplified)</div>
+      <p>The offline replay with Gmsh 4.13.1 then refined 773 → 876 wall vertices, with the longest eligible panel at 1.49 × target and a solid energy transfer residual of 7.3 × 10⁻¹¹ J/m, and the explicit-layer fluid remesh had 456,270 cells, zero invalid cells and minimum scaled Jacobian 0.290 (Figures 3, 4, 7, 8). The replay used the verified 1030 s checkpoint and the saved shot-6 CFD fields; no SU2 run was involved.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="code">Where it lives <span class="level advanced">Advanced</span></h2>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <ul>
+          <li><code>icing/mesh.py</code>: <code>Mesh</code> (SU2 reader/writer, <code>surface</code>, <code>cell_metrics</code>, <code>quality</code>, <code>require_valid</code>, <code>topology</code>).</li>
+          <li><code>icing/ice_mesh_quality.py</code>: <code>ice_quality</code>, <code>restore_ice_shape</code> (Delaunay flips of the ice conduction mesh).</li>
+          <li><code>icing/wall_resolution.py</code>: <code>WallResolution</code> settings, <code>target_spacing</code>, <code>grade</code>, <code>refine_wall</code>, <code>resolution_report</code>.</li>
+          <li><code>icing/wall_refinement.py</code>: <code>wall_status</code>, <code>refine_nodal_wall</code>, <code>select_cavity</code>, <code>remesh_cavity</code>, <code>_cavity_transfer</code>, <code>WallRefinementError</code>.</li>
+          <li><code>icing/coupled_wall_refinement.py</code>: the same refinement on the glaze coupled history and phase columns.</li>
+          <li><code>icing/deformed_wall.py</code>: <code>_canonical_deformed_wall</code>, <code>_canonical_remeshed_wall</code>.</li>
+          <li><code>icing/fluid_remesh.py</code>: <code>FluidRemeshSettings</code>, <code>first_height_for_yplus</code>, <code>explicit_layers</code>, <code>remesh_fluid</code>, <code>wall_layer_metrics</code>.</li>
+          <li><code>icing/mesh_adaptation.py</code>: <code>MeshAdaptation</code>, <code>deformation_checks</code>, <code>update_fluid_mesh</code>.</li>
+          <li><code>icing/su2_warm_start.py</code>: <code>map_steady_restart</code> (deformed meshes), <code>map_restart_to_mesh</code> (any mesh, wall-relative).</li>
+          <li>Docs: <code>docs/MESH_ADAPTATION.md</code>, <code>docs/SOLID_REMESH_TRANSFER.md</code>, <code>docs/PHYSICS_REVIEW.md</code> (2026-11-17 entry).</li>
+          <li>Figures: <code>_build/fig_mesh.py</code> (reads the saved meshes with <code>icing.mesh.Mesh</code>; no CFD is run).</li>
+        </ul></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

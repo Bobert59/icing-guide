@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Icing Physics · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Section 2 · Start here</div>
+      <h1>Icing physics in plain words</h1>
+      <p class="lede">The handful of physical ideas you need before reading the solver: supercooled droplets,
+        how much water reaches the wing, why some water freezes at once and some does not, and why ice
+        shapes differ so much with only a few degrees of temperature change.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#cloud">Supercooled clouds</a> <span class="level basic">Basic</span></li>
+          <li><a href="#catch">How much water hits the wing</a> <span class="level basic">Basic</span></li>
+          <li><a href="#freeze">Why not all water freezes</a> <span class="level basic">Basic</span></li>
+          <li><a href="#types">Rime, mixed and glaze ice</a> <span class="level basic">Basic</span></li>
+          <li><a href="#numbers">Putting numbers on it</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#feedback">Why simulation is hard</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#solver">How these ideas map onto the solver</a> <span class="level intermediate">Intermediate</span></li>
+        </ol>
+      </div>
+
+      <h2 id="cloud">Supercooled clouds <span class="level basic">Basic</span></h2>
+      <p>Pure water in small droplets does not freeze at 0 °C. It needs a nucleus, such as a speck of dust or
+        an ice crystal, to start freezing. Without one, cloud droplets stay liquid well below 0 °C. These
+        droplets are called <strong>supercooled</strong>. They are unstable: when one touches a surface such
+        as a wing, it starts to freeze.</p>
+      <p>Three numbers describe an icing cloud for the solver:</p>
+      <ul>
+        <li><strong>Liquid water content (LWC)</strong>: mass of liquid water per volume of air. Icing clouds
+          have a fraction of a gram per cubic metre. The solver uses SI units, so 0.52 g/m³ is written
+          <code>"lwc": 0.00052</code> (kg/m³).</li>
+        <li><strong>Droplet size</strong>: usually summarised by the <strong>median volumetric diameter
+          (MVD)</strong>, the diameter that splits the water mass in half. Typical values are 15–40 µm. A
+          single MVD can stand in for the whole cloud, or the cloud can be split into <em>size bins</em>, each
+          carrying a share of the water mass (Figure 1).</li>
+        <li><strong>Air temperature and speed</strong>: these decide how quickly the surface loses heat.</li>
+      </ul>
+
+      <figure>
+        <div class="frame"><img src="figures/basics_droplet_bins.png" alt="Bar chart of seven droplet size bins and their mass fractions"></div>
+        <figcaption><b>Figure 1.</b> The cloud of the RG-15 test case (2nd Ice Prediction Workshop, IPW-2),
+          as it appears in the case file <code>nodal_case_32.json</code>. Seven droplet sizes from 7.3 to
+          81.3 µm carry 5–30 % of the water each. The 26.8 µm bin carries the most and sits at the measured MVD
+          (26.8 µm, <code>data/rg15_ipw2/conditions.json</code>). Large droplets are few, but they hit the
+          wing over a wider area.</figcaption>
+      </figure>
+
+      <h2 id="catch">How much water hits the wing <span class="level basic">Basic</span></h2>
+      <p>Air flowing towards a wing slows down and turns to pass around it. Droplets are much denser than air,
+        so they do not turn as easily. Small droplets mostly follow the air and miss. Large droplets keep
+        going nearly straight and hit. Where and how hard they hit depends on droplet size, speed and the size
+        of the body. One dimensionless number captures this: the <strong>Stokes number</strong>, the
+        droplet's stopping distance divided by the body size.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 780 300" role="img" aria-label="Droplet trajectories around a leading edge, showing impingement limits and collection efficiency">
+          <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+          <!-- airfoil nose -->
+          <path d="M470,150 C 470,95 540,70 760,62 L760,238 C 540,230 470,205 470,150 Z" fill="#e9e6e0" stroke="var(--text)" stroke-width="1.5"/>
+          <!-- streamlines (air) -->
+          <path d="M20,60 C 300,60 420,50 520,40 L 760,30" class="d-line" stroke-dasharray="3 4"/>
+          <path d="M20,110 C 330,110 420,85 500,72 L 760,52" class="d-line" stroke-dasharray="3 4"/>
+          <path d="M20,190 C 330,190 420,215 500,228 L 760,248" class="d-line" stroke-dasharray="3 4"/>
+          <path d="M20,240 C 300,240 420,250 520,260 L 760,270" class="d-line" stroke-dasharray="3 4"/>
+          <!-- droplets -->
+          <path d="M20,98 C 330,98 440,96 492,100" stroke="var(--accent)" stroke-width="2" fill="none"/>
+          <path d="M20,125 C 330,125 430,128 474,132" stroke="var(--accent)" stroke-width="2" fill="none"/>
+          <path d="M20,150 L 468,150" stroke="var(--accent)" stroke-width="2" fill="none"/>
+          <path d="M20,175 C 330,175 430,172 474,168" stroke="var(--accent)" stroke-width="2" fill="none"/>
+          <path d="M20,203 C 330,203 440,206 494,203" stroke="var(--accent)" stroke-width="2" fill="none"/>
+          <path d="M20,84 C 320,84 430,72 540,62 L 760,48" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="7 4"/>
+          <path d="M20,218 C 320,218 430,232 540,240 L 760,254" stroke="var(--accent)" stroke-width="2" fill="none" stroke-dasharray="7 4"/>
+          <circle cx="492" cy="100" r="4" fill="var(--accent)"/><circle cx="474" cy="132" r="4" fill="var(--accent)"/>
+          <circle cx="468" cy="150" r="4" fill="var(--accent)"/><circle cx="474" cy="168" r="4" fill="var(--accent)"/>
+          <circle cx="494" cy="203" r="4" fill="var(--accent)"/>
+          <!-- dy0 bracket -->
+          <path d="M60,98 L60,203" stroke="var(--warm)" stroke-width="2"/>
+          <path d="M52,98 L68,98 M52,203 L68,203" stroke="var(--warm)" stroke-width="2"/>
+          <text x="76" y="150" class="d-text" fill="var(--warm)">Δy₀ upstream</text>
+          <!-- ds bracket on wall -->
+          <path d="M455,100 C 438,130 438,170 455,203" stroke="var(--ok)" stroke-width="3" fill="none"/>
+          <text x="330" y="282" class="d-text">Droplets released over a height Δy₀ upstream hit the wall over a length Δs.</text>
+          <text x="560" y="155" class="d-text">airfoil</text>
+          <text x="590" y="24" class="d-muted">air streamline (dotted)</text>
+          <text x="560" y="98" class="d-muted">dashed: a droplet that just misses</text>
+          <text x="380" y="96" class="d-muted" text-anchor="end">impact</text>
+          <text x="405" y="248" class="d-muted" fill="var(--ok)">impact zone Δs</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 2.</b> A sketch of droplet impingement (not to scale). Droplets (blue) cross the
+          air streamlines (dotted) because of their inertia. The outermost droplets that still touch the wing
+          mark the <b>impingement limits</b>. Real computed trajectories are on the <a href="droplets.html">droplets page</a>.</figcaption>
+      </figure>
+
+      <p>The local <strong>collection efficiency</strong> β compares the water that actually lands on a piece
+        of wall with the water that would land if the droplets did not swerve at all:</p>
+      $$\beta = \frac{\text{water mass rate hitting a wall piece}}{\mathrm{LWC}\;U_\infty\;\Delta s} \;\approx\; \frac{\Delta y_0}{\Delta s}$$
+      <p>Here \(U_\infty\) is the free-stream speed and \(\Delta s\) the length of the wall piece. β is
+        largest near the stagnation point and falls to zero at the impingement limits. The
+        <a href="droplets.html">droplets page</a> shows the computed β curve for the RG-15 case. The water <em>mass flux</em> reaching the wall is then
+        \(\dot m'' = \beta\,\mathrm{LWC}\,U_\infty\) in kg/(m²·s).</p>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>β answers "what fraction of the water in front of this bit of wing actually lands on it?". Big
+          droplets, fast flow and small, sharp leading edges give β close to 1. Small droplets around a big,
+          blunt body give small β.</p></div>
+
+      <h2 id="freeze">Why not all water freezes <span class="level basic">Basic</span></h2>
+      <p>Freezing releases heat. Every kilogram of water that turns to ice gives off the <strong>latent heat
+        of fusion</strong>, about 334 kJ. If that heat is not carried away, the surface warms up to 0 °C and
+        freezing stops. So the amount that freezes depends on how fast the surface can lose heat. It loses heat
+        in four main ways:</p>
+      <ol>
+        <li><strong>Convection</strong>: the cold air flowing past cools the surface. This is the biggest term.
+          Its strength is the <strong>heat-transfer coefficient</strong> \(h\) (W/m²K), which the CFD provides.</li>
+        <li><strong>Evaporation</strong> (or sublimation from ice): water leaving as vapour takes a lot of heat
+          with it (about 2.5 MJ/kg).</li>
+        <li><strong>Warming the incoming droplets</strong>: droplets arrive below 0 °C and must be warmed to the
+          freezing point first.</li>
+        <li><strong>Conduction</strong> into the ice and the airfoil underneath.</li>
+      </ol>
+      <p>Two effects warm the surface: <strong>aerodynamic heating</strong> (air slowing down near the wall
+        warms slightly; the solver uses a <em>recovery temperature</em>) and the droplets' <strong>kinetic
+        energy</strong> on impact. Both are small at 25 m/s but are kept in the balance.</p>
+      <p>The share of the arriving water that freezes is called the <strong>freezing fraction</strong>
+        \(n\), between 0 and 1. If \(n = 1\), every droplet freezes where it lands. If \(n &lt; 1\), the
+        surface sits at 0 °C, covered by a thin liquid film. The air pushes the film back along the wing,
+        where it may freeze later. This is called <strong>runback</strong>.</p>
+      <p>This way of treating a small piece of wall as a box with mass and energy flowing in and out is the
+        <strong>Messinger model</strong> (1953). It is the basis of almost all icing codes, including this
+        one. The <a href="thermo.html">energy balance page</a> goes through every term.</p>
+
+      <h2 id="types">Rime, mixed and glaze ice <span class="level basic">Basic</span></h2>
+      <p>The freezing fraction decides what the ice looks like:</p>
+      <ul>
+        <li><strong>Rime ice</strong> (cold, roughly below −10 °C, \(n = 1\)): droplets freeze on impact.
+          Air gets trapped, so the ice is white and opaque. The shape follows where droplets hit, often a
+          streamlined "spearhead" pointing into the flow.</li>
+        <li><strong>Glaze ice</strong> (near 0 °C, \(n &lt; 1\)): water runs back before freezing. The ice is
+          clear and dense, and it often grows <strong>horns</strong> on either side of the leading edge. Horns
+          are the worst for aerodynamics because they make the flow separate.</li>
+        <li><strong>Mixed ice</strong>: in between, with a rime-like core and glaze features.</li>
+      </ul>
+
+      <figure class="wide">
+        <div class="frame"><img src="figures/basics_rime_mixed_glaze.png" alt="Three measured ice outlines on the RG-15 airfoil: rime, mixed and glaze"></div>
+        <figcaption><b>Figure 3.</b> Real measured ice shapes from the RG-15 experiments used as this project's
+          main benchmark (<code>data/rg15_ipw2/processed/*_open_x35mm.csv</code>). The cloud, speed (25 m/s) and
+          exposure (1200 s) are the same; only the air temperature changes. <b>(1)</b> Rime at −10 °C: a pointed
+          shape that grows straight into the flow. <b>(4)</b> Mixed at −4 °C: a blunter, flatter front.
+          <b>(2, 3)</b> Glaze at −2 °C: water runs back and freezes off the stagnation line, forming an upper
+          horn (2) and a lower ridge (3). The outlines are open curves that stop 35 mm behind the leading edge.
+          Their exact registration on the airfoil is uncertain by a fraction of a millimetre (see
+          <a href="validation.html">validation</a>).</figcaption>
+      </figure>
+
+      <h2 id="numbers">Putting numbers on it <span class="level intermediate">Intermediate</span></h2>
+      <p>Two back-of-the-envelope estimates, using the RG-15 conditions, show the size of things.</p>
+      <h3>How thick can the ice get?</h3>
+      <p>If every droplet in front of the leading edge hit and froze (β = 1, \(n = 1\)), the ice would thicken at</p>
+      $$\frac{\beta\,\mathrm{LWC}\,U_\infty}{\rho_{ice}} = \frac{1 \times 0.00052 \times 25}{917} \approx 1.4\times10^{-5}\ \text{m/s},$$
+      <p>that is, about 17 mm in 1200 s. The measured rime front grew about 14 mm (Figure 3), which fits a peak
+        β somewhat below 1 and ice that is not exactly 917 kg/m³. This simple rate,
+        \(\beta\,\mathrm{LWC}\,U_\infty\), is the starting point of the droplet calculation.</p>
+      <h3>How much can the droplets' own coldness absorb?</h3>
+      <p>Before freezing, a droplet at temperature \(T_d\) must be warmed to 0 °C. That costs
+        \(c_w (T_m - T_d)\) per kilogram, with \(c_w \approx 4.2\) kJ/(kg·K). Compare it with the latent heat
+        released by freezing, \(L_f \approx 334\) kJ/kg:</p>
+      <div class="table-wrap"><table>
+        <tr><th>Case</th><th>Air / droplet temperature</th><th>Heat to warm droplet</th><th>As share of latent heat</th></tr>
+        <tr><td>3.1 glaze</td><td>−2 °C</td><td>≈ 8 kJ/kg</td><td>≈ 2.5 %</td></tr>
+        <tr><td>3.2 mixed</td><td>−4 °C</td><td>≈ 17 kJ/kg</td><td>≈ 5 %</td></tr>
+        <tr><td>3.3 rime</td><td>−10 °C</td><td>≈ 42 kJ/kg</td><td>≈ 13 %</td></tr>
+      </table></div>
+      <p>So the droplets themselves soak up only a small part of the freezing heat. Most of it must go into the
+        air by convection and evaporation. Both grow roughly in proportion to how far the surface is above
+        the air temperature. At −10 °C the air can carry the heat away; at −2 °C it often cannot, and a film
+        forms. That is why a few degrees separate rime from glaze.</p>
+
+      <div class="callout why"><div class="callout-title">Why the freezing fraction falls near 0 °C</div>
+        <p>The heat that can be removed is roughly \(h\,(T_m - T_{air})\) plus evaporation. It shrinks
+          towards zero as the air approaches 0 °C. The heat that must be removed to freeze everything is
+          \(\dot m'' L_f\), which does not depend on temperature. When the first is smaller than the second,
+          \(n &lt; 1\).</p></div>
+
+      <h2 id="feedback">Why simulation is hard <span class="level intermediate">Intermediate</span></h2>
+      <ul>
+        <li><strong>Everything feeds back.</strong> Ice changes the shape. The shape changes the airflow, which
+          changes where droplets land and how fast heat leaves. So the calculation has to be repeated as the ice
+          grows (the "shots" of the <a href="overview.html#loop">icing loop</a>).</li>
+        <li><strong>Ice is rough.</strong> Rough ice increases heat transfer and changes the boundary layer, and
+          its roughness is not known in advance. The solver has roughness models, but calibrating them for ice
+          is an open problem (<a href="airflow.html">airflow page</a>).</li>
+        <li><strong>Small scales matter.</strong> Horns, pockets and sharp tips are millimetres across on a
+          300 mm wing. The wall must be finely resolved, and the CFD mesh must follow every change
+          (<a href="mesh.html">mesh page</a>).</li>
+        <li><strong>Water is complicated.</strong> Films run back, break into rivulets, are shed from the
+          surface, or splash on impact. Each needs a model, and each model has limits
+          (<a href="film.html">film page</a>).</li>
+        <li><strong>Experiments are hard to match exactly.</strong> Tunnel walls, uncertain conditions and
+          uncertain measured outlines all make comparison difficult (<a href="validation.html">validation page</a>).</li>
+      </ul>
+
+      <h2 id="solver">How these ideas map onto the solver <span class="level intermediate">Intermediate</span></h2>
+      <div class="table-wrap"><table>
+        <tr><th>Physical idea</th><th>In the solver</th><th>Page</th></tr>
+        <tr><td>Airflow, heat-transfer coefficient \(h\), wall shear</td><td>SU2 RANS with an isothermal wall; wall fields read back by <code>fields.py</code></td><td><a href="airflow.html">3</a></td></tr>
+        <tr><td>Droplet paths, β, impingement limits</td><td>Lagrangian trajectories in <code>droplets.py</code>, with mass-weighted seeds and size bins</td><td><a href="droplets.html">4</a></td></tr>
+        <tr><td>Messinger balance, freezing fraction</td><td><code>thermo.py</code> (panel model), <code>nodal_phase.py</code> (conducting path)</td><td><a href="thermo.html">5</a></td></tr>
+        <tr><td>Runback film</td><td>Thin-film lubrication flux with finite volumes on wall panels</td><td><a href="film.html">6</a></td></tr>
+        <tr><td>Conduction into ice and airfoil</td><td>2D triangle mesh of ice + substrate, enthalpy method</td><td><a href="solid.html">7</a></td></tr>
+        <tr><td>Ice thickness from mass</td><td>Mass → volume with ice density; layered growth of the wall</td><td><a href="growth.html">8</a></td></tr>
+        <tr><td>Glaze: water inside the ice, melting</td><td>Phase-aware columns and the glaze campaign</td><td><a href="glaze.html">10</a></td></tr>
+      </table></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>

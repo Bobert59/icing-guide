@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Droplets and collection · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 4 · Droplets and collection</div>
+      <h1>Droplets and collection</h1>
+      <p class="lede">With the airflow in hand, the solver follows supercooled cloud droplets from far upstream until they hit
+        the body or fly past it. Counting where the water lands gives the collection efficiency \(\beta\) and the impinging
+        mass and energy on every wall panel: the water supply for ice growth. This page explains the droplet model, how mass is
+        assigned to each simulated droplet, how impacts are found, and the checks that guard against missing water.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#terms">LWC, MVD and collection efficiency</a> <span class="level basic">Basic</span></li>
+          <li><a href="#motion">How a droplet moves</a> <span class="level basic">Basic</span></li>
+          <li><a href="#seeds">From inlet seeds to water on panels</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#bins">Size bins</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#rg15">A real result: RG-15 collection</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#inlet">Is the inlet wide enough and far enough upstream?</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#refine">Are there enough seeds?</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#energy">Impact kinetic energy and splash</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#parallel">Running millions of trajectories: workers and checkpoints</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#deposit">Putting the water into material</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#code">In the code</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="terms">LWC, MVD and collection efficiency <span class="level basic">Basic</span></h2>
+      <p>An icing cloud is described by two numbers.</p>
+      <ul>
+        <li><strong>LWC, liquid water content</strong>: the mass of liquid water per volume of air, in kg/m³ in the code
+          (usually quoted in g/m³). RG-15 case 3.1 uses 0.52 g/m³ = 0.00052 kg/m³ (<code>nodal_case_31.json</code>).</li>
+        <li><strong>MVD, median volumetric diameter</strong>: half of the water mass is in droplets smaller than this diameter.
+          RG-15 uses 27 µm (the revised value of the IPW2 case document, <code>docs/PROGRESS.md</code>). Inputs named
+          <code>mvd</code> or <code>diameter</code> are in metres.</li>
+      </ul>
+      <p>If the body did not disturb the air, every droplet in the tube of air ahead of a panel would hit it. The mass flux
+        arriving on a surface facing the flow would be \(\mathrm{LWC}\,U_\infty\) (kg per m² per s). The air does disturb the
+        droplets: it turns around the body, and small droplets turn with it. The <strong>local collection efficiency</strong>
+        \(\beta\) is the fraction of that undisturbed flux that actually lands on a panel:</p>
+      $$\beta_i = \frac{\dot m_i}{\mathrm{LWC}\;U_\infty\;\ell_i}$$
+      <p>where \(\dot m_i\) is the water mass rate captured by panel \(i\) (kg per metre span per second) and \(\ell_i\) its
+        length. At the stagnation point of a large body \(\beta\) approaches 1; it falls to 0 at the
+        <strong>impingement limits</strong>, the farthest points on the upper and lower surfaces that droplets reach. The total
+        <strong>collection efficiency</strong> \(E\) of a body is the captured mass divided by the flux through its frontal
+        height.</p>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>\(\beta\) answers "what share of the water heading for this bit of wall actually arrives?". It is the single most
+          important input for where ice grows, and it is set by how well each droplet can follow the air.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="motion">How a droplet moves <span class="level basic">Basic</span></h2>
+      <p>Each droplet is a small rigid sphere of water carried by the air. Only two forces act on it: aerodynamic drag, and
+        (optionally) gravity minus the buoyancy of the displaced air. The air is not affected by the droplets (one-way coupling,
+        a dilute cloud). In the code (<code>icing/droplets.py</code>, <code>drag_acceleration</code>, and <code>MODELS.md</code>):</p>
+      $$\frac{d\mathbf x}{dt} = \mathbf v,\qquad
+        \frac{d\mathbf v}{dt} = \frac{18\,\mu_a}{\rho_w d^2}\,f(Re_d)\,(\mathbf u - \mathbf v) + \Big(1-\frac{\rho_a}{\rho_w}\Big)\mathbf g$$
+      $$Re_d = \frac{\rho_a\, d\,|\mathbf u-\mathbf v|}{\mu_a},\qquad
+        f = \begin{cases}1+0.15\,Re_d^{0.687} & Re_d\le 1000\\ 0.44\,Re_d/24 & Re_d>1000\end{cases}$$
+      <p>Here \(\mathbf x,\mathbf v\) are the droplet position and velocity, \(\mathbf u\) the air velocity at the droplet,
+        \(d\) its diameter, \(\rho_w\) the water density (1000 kg/m³ by default), \(\rho_a, \mu_a\) the air density and viscosity,
+        and \(\mathbf g\) gravity. \(f\) is the Schiller–Naumann correction to Stokes drag; above \(Re_d=1000\) the drag coefficient
+        is held at 0.44. With \(f=1\) the drag is exactly Stokes' law.</p>
+<pre><code class="language-python">def drag_acceleration(velocity, air_velocity, diameter, rho_air=1.225, mu_air=1.72e-5, rho_water=1000.):
+    slip = np.asarray(air_velocity) - velocity
+    re = rho_air * np.linalg.norm(slip, axis=-1) * diameter / mu_air
+    correction = np.where(re &lt;= 1000, 1 + .15 * re ** .687, .44 * re / 24)
+    return (18 * mu_air / (rho_water * diameter ** 2)) * np.expand_dims(correction, -1) * slip</code></pre>
+      <div class="code-src">icing/droplets.py, drag_acceleration()</div>
+
+      <h3>The Stokes number: why size matters so much</h3>
+      <p>The prefactor \(18\mu_a/(\rho_w d^2)\) is one over the droplet's <em>relaxation time</em>
+        \(\tau_d = \rho_w d^2/(18\mu_a)\): roughly how long the droplet needs to adjust to a change in the air velocity. Compare
+        it with the time the air takes to turn around the body, \(R/U_\infty\). Their ratio is the inertia parameter (Stokes
+        number) used by the project's NACA 1215 benchmark (<code>tools/validate_naca_cylinder.py</code>):</p>
+      $$K = \frac{\rho_w\, d^2\, U_\infty}{18\,\mu_a\, R}$$
+      <p>Because \(d\) enters squared, a droplet three times larger has nine times the inertia. Small \(K\): the droplet follows
+        the streamlines and misses. Large \(K\): it ploughs straight on and hits.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_cylinder_trajectories.png" alt="Droplet trajectories of three sizes around a cylinder in potential flow, with streamlines, impacts and a grazing trajectory"></div>
+        <figcaption><b>Figure 1.</b> Trajectories computed for this page with the production <code>collect()</code> on the
+          analytic potential-flow cylinder of <code>tools/compare_nasa_cylinder.py</code> (NASA CR-4257: 0.1016 m diameter,
+          80.25 m/s). Grey: air streamlines. Blue: droplets that hit (red dots: impact points); dark grey: misses. Orange: the
+          <strong>grazing trajectory</strong>, found by bisecting the inlet offset until the droplet just touches the wall; its
+          start height is the capture half-width. Left: 5.6 µm droplets (\(K = 0.16\)) follow the air; only a band 0.0004 R wide
+          hits. Middle: 20.4 µm (\(K = 2.1\)) hit up to 0.35 R. Right: 66 µm (\(K = 22\)) hit up to 0.79 R and reach far around the
+          cylinder. Script: <code>_build/fig_droplets.py</code>.</figcaption>
+      </figure>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_efficiency_vs_K.png" alt="Total collection efficiency of each droplet bin against the inertia parameter K"></div>
+        <figcaption><b>Figure 2.</b> The total collection efficiency of each of the seven CR-4257 size bins, from saved
+          capture-limit bisections (<code>runs/nasa4257_capture_limits_001/refinement.json</code>, 10 radii upstream). \(E\) rises
+          from 0.0004 at \(K=0.16\) to 0.79 at \(K=22\). The mass-weighted mixture gives \(E = 0.359\): the large-drop tail matters far
+          more than its 5 % mass share suggests.</figcaption>
+      </figure>
+
+      <div class="callout limits"><div class="callout-title">What the droplet model leaves out</div>
+        <ul>
+          <li>Deformation, breakup, turbulent dispersion and droplet heat transfer in flight (the incoming droplet temperature is
+            prescribed). The intended scope is conventional cloud droplets, not supercooled large droplets (<code>MODELS.md</code>).</li>
+          <li>Gravity is off by default; RG-15 switches it on (<code>"gravity": [0, -9.81]</code>). The inlet then still starts
+            droplets at the freestream velocity unless a bin supplies <code>inlet_velocity</code>; settling slip is not inferred.</li>
+          <li>Schiller–Naumann is an empirical sphere-drag fit. The NACA 1215 benchmark shows a persistent 6.5 % deficit at
+            \(K=4\) that the historical drag table does not explain (<code>docs/VALIDATION.md</code>).</li>
+        </ul></div>
+
+      <!-- ============================================================ -->
+      <h2 id="seeds">From inlet seeds to water on panels <span class="level intermediate">Intermediate</span></h2>
+      <p>The solver does not simulate a random cloud. It uses a deterministic <strong>flux quadrature</strong>: a straight
+        <em>inlet line</em> is placed upstream, perpendicular to the freestream, and divided into cells. One droplet ("seed")
+        starts at the midpoint of each cell and carries the mass flux that crosses that cell:</p>
+      $$\dot m_\text{seed} = \mathrm{LWC}\;(\mathbf v_\text{in}\cdot\hat{\mathbf U})\;\Delta y\;\phi_b$$
+      <p>with \(\Delta y\) the cell width, \(\hat{\mathbf U}\) the freestream direction, \(\mathbf v_\text{in}\) the starting
+        droplet velocity (the freestream by default) and \(\phi_b\) the mass fraction of size bin \(b\). Only the <em>normal</em>
+        velocity counts: it is the flux through the line. A droplet that hits panel \(i\) adds its \(\dot m_\text{seed}\) to that
+        panel; one that crosses the downstream plane is counted as escaped.</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+          <svg class="diagram" viewBox="0 0 900 300" role="img" aria-label="Inlet seeding and impact detection">
+            <defs><marker id="dh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+            <line x1="90" y1="30" x2="90" y2="270" stroke="var(--warm)" stroke-width="4"/>
+            <text class="d-text" x="90" y="20" text-anchor="middle">inlet line</text>
+            <rect x="90" y="30" width="18" height="12" fill="#f6d4d1"/><rect x="90" y="258" width="18" height="12" fill="#f6d4d1"/>
+            <text class="d-muted" x="115" y="40">guard 5 %</text><text class="d-muted" x="115" y="268">guard 5 %</text>
+            <g>
+              <line x1="80" y1="110" x2="100" y2="110" class="d-line"/><line x1="80" y1="140" x2="100" y2="140" class="d-line"/>
+              <text class="d-muted" x="22" y="130">Δy</text>
+              <circle cx="90" cy="125" r="5" fill="var(--accent)"/>
+            </g>
+            <path class="d-arrow" d="M95 125 C 300 125, 450 130, 560 150" />
+            <path d="M95 185 C 300 185, 470 200, 600 215 C 700 228, 780 235, 870 240" class="d-line" stroke-dasharray="5 4"/>
+            <text class="d-muted" x="700" y="258">escaped: crosses the downstream plane</text>
+            <path d="M560 150 Q 640 60 760 110 Q 820 150 760 190 Q 640 230 560 150 Z" class="d-box"/>
+            <text class="d-text" x="690" y="155" text-anchor="middle">body</text>
+            <circle cx="540" cy="146" r="5" fill="var(--accent)"/>
+            <circle cx="578" cy="152" r="5" fill="none" stroke="var(--accent)" stroke-width="2"/>
+            <line x1="540" y1="146" x2="578" y2="152" stroke="var(--warm)" stroke-width="3"/>
+            <text class="d-muted" x="430" y="100">one RK45 step</text>
+            <line x1="470" y1="105" x2="545" y2="140" class="d-line"/>
+            <circle cx="561" cy="149" r="4" fill="var(--measured, #d62728)"/>
+            <text class="d-muted" x="455" y="190">earliest crossing of the</text>
+            <text class="d-muted" x="455" y="206">step with a wall panel</text>
+            <text class="d-text" x="200" y="112">ṁ = LWC · (v·Û) · Δy · φ_b</text>
+            <circle cx="300" cy="150" r="11" fill="var(--warm)"/><text x="300" y="154" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">1</text>
+            <circle cx="560" cy="122" r="11" fill="var(--warm)"/><text x="560" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">2</text>
+            <circle cx="650" cy="232" r="11" fill="var(--warm)"/><text x="650" y="236" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">3</text>
+          </svg>
+        </div>
+        <figcaption><b>Figure 3.</b> (1) Each inlet cell launches one seed at its midpoint, carrying the flux through the cell.
+          (2) After every accepted RK45 step the straight segment between the old and new positions is tested against all wall
+          panels; the earliest crossing is the impact, and its panel receives the seed's mass. (3) A seed that crosses the
+          downstream plane escapes. The red bands at the inlet ends are the 5 % guards checked by the inlet audit.</figcaption>
+      </figure>
+
+      <h3>Integration and impact detection</h3>
+      <p>Each seed is integrated by SciPy's adaptive Runge–Kutta 45 (<code>scipy.integrate.RK45</code>) with tolerances
+        <code>rtol</code>, <code>atol</code> and a maximum step <code>max_step</code> (RG-15: 10⁻⁶, 10⁻⁹ and 10⁻⁴ s). The air velocity
+        comes from the CFD: <code>VTKVelocityField</code> finds the original SU2 cell containing the point and interpolates its
+        node values linearly. It never interpolates across the solid (no Delaunay bridging); a point outside the CFD mesh is an
+        error, except inside the body, where an integrator stage that overshoots briefly sees zero velocity until the collision
+        is located.</p>
+<pre><code class="language-python">while solver.status == 'running':
+    previous = solver.y.copy()
+    solver.step()
+    hit = first_hit(previous[:2], solver.y[:2])          # earliest wall crossing on this segment
+    if hit is not None:
+        panel, fraction = hit
+        impact_v = previous[2:] + fraction * (solver.y[2:] - previous[2:])
+    if hit is not None or solver.y[:2] @ direction &gt;= downstream:
+        return dict(panel=panel, impact_velocity=impact_v, ...)
+raise UnresolvedDropletError(...)                         # max_time reached: never counted as escape</code></pre>
+      <div class="code-src">icing/droplets.py, _track_seed() (simplified)</div>
+      <p><code>first_hit</code> (<code>Surface.fixed_intersector</code> in <code>icing/geometry.py</code>) solves the
+        segment–segment intersection with every panel and returns the one with the smallest line parameter, so a droplet that
+        crosses a thin horn hits its first face. The impact velocity is interpolated linearly along the step. Because the test uses
+        the straight chord of each step, <code>MODELS.md</code> calls maximum-step refinement "mandatory".</p>
+
+      <h3>The mass ledger</h3>
+      <p><code>collect()</code> keeps three independent sums: launched, impacted (plus splashed, if splash is on) and escaped.
+        Two checks follow, and either failing stops the run:</p>
+<pre><code class="language-python">beta = mass / (lwc * speed * surface.lengths)
+if abs(result.mass_residual) &gt; 1e-11 * max(launched, 1e-30):
+    raise RuntimeError('Droplet flux ledger did not close')
+inlet_flux = lwc * inlet_width * sum(b.mass_fraction * normal_speed(b) for b in bins)
+if abs(launched - inlet_flux) &gt; 1e-10 * max(inlet_flux, 1e-30):
+    raise RuntimeError('Tracked droplet weights do not carry the inlet mass flux')</code></pre>
+      <div class="code-src">icing/droplets.py, collect() (simplified)</div>
+      <p>The first is a rounding check (launched = impacted + escaped + splashed). The second is independent: the seed weights
+        must add up to the analytical flux through the whole inlet. A trajectory that neither hits nor leaves within
+        <code>max_time</code> raises <code>UnresolvedDropletError</code> with a full diagnostic; it is never quietly dropped. For
+        RG-15 3.1 shot 7 the ledger residual was −1.8×10⁻¹⁷ kg/(m s) on a capture of 1.68×10⁻⁴ kg/(m s)
+        (<code>collect/audit.json</code>).</p>
+      <div class="callout why"><div class="callout-title">Why a Lagrangian quadrature, not an Eulerian droplet field</div>
+        <p><code>MODELS.md</code> gives the reasons: individual trajectories handle crossing paths (which an Eulerian
+          pressureless-fluid model cannot without extra closures), and they separate inlet-quadrature error from CFD-mesh error,
+          which can then be refined separately. Eulerian transport is noted as attractive for 3-D but is not implemented.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="bins">Size bins <span class="level intermediate">Intermediate</span></h2>
+      <p>A real cloud has a spread of sizes. The solver represents it with <code>DropletBin</code>s, each with a diameter and a
+        <strong>mass fraction</strong> (not a number fraction); the fractions must sum to one within 10⁻¹². Each bin is seeded and
+        tracked separately, and their panel masses add up. The cases used here have seven bins with mass fractions
+        0.05 / 0.10 / 0.20 / 0.30 / 0.20 / 0.10 / 0.05, the seven-bin distribution given in the IPW-2 case description (<code>data/rg15_ipw2/conditions.json</code>).
+        The code does not name it; the diameters come from each source: CR-4257 Table E.5 for the cylinder
+        (\(d/\mathrm{MVD}\) from 0.277 to 3.25, <code>data/nasa_cr4257_cylinder.json</code>) and the IPW2 v12 case document for RG-15
+        (7.3 to 81.3 µm).</p>
+      <p>Bins matter beyond the average: Figure 2 shows that the 5 % largest-drop bin is captured far more efficiently than the
+        smallest, and it alone sets the impingement limits. That is why the seed-refinement test checks every bin separately (below).</p>
+
+      <!-- ============================================================ -->
+      <h2 id="rg15">A real result: RG-15 collection <span class="level intermediate">Intermediate</span></h2>
+      <p>In a campaign, <code>campaign.run_collection</code> builds a <code>VTKVelocityField</code> from the shot's accepted
+        <code>flow.vtu</code>, scaled by \(U_\infty\), and calls <code>collect()</code> with the nodal case's droplet settings and a
+        fixed number of seeds per bin (<code>collection_seeds</code>: 25,664 for RG-15). Note that the campaign removes the
+        case's <code>seed_refinement</code> block and does not run the refinement loop; refinement is done in separate studies
+        (below) and in the legacy controller. The result is saved as <code>forcing.npz</code> (surface points and ids,
+        <code>mass_rate</code>, <code>kinetic_rate</code>, <code>beta</code>) and sealed with an <code>audit.json</code> that says
+        <code>collection_qualified: false</code>.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_rg15_trajectories.png" alt="Droplet trajectories through the real SU2 field of the iced RG-15 airfoil"></div>
+        <figcaption><b>Figure 4.</b> Eleven seeds each of the smallest (7.3 µm) and largest (81.3 µm) RG-15 bins, tracked for this
+          page through the accepted SU2 field of case 3.1 shot 7 with the case's own settings (gravity on, inlet at x = −0.6 m).
+          Left (vertical scale stretched): with gravity the captured droplets start up to 31 mm <em>below</em> the airfoil's axis
+          (in the production audit only the largest bin reaches above it, by 0.6 mm) and drift down on the way. Right: at the iced leading edge, small drops curve with the air and land only near the nose
+          (or miss); large drops cut straight through and reach the horn faces and far along both surfaces. Faint lines are
+          misses.</figcaption>
+      </figure>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_rg15_beta.png" alt="Local collection efficiency and mean impact speed along the RG-15 surface, clean and iced"></div>
+        <figcaption><b>Figure 5.</b> Production results, RG-15 case 3.1 (<code>shot_01/collect/forcing.npz</code> and
+          <code>shot_07</code>). Top: \(\beta\) peaks at 0.81 on the clean airfoil and 0.83 on the iced one, where it becomes jagged:
+          zero in the shadow behind ice features, peaks on faces turned to the flow. The upper impingement limit (dotted) moves from
+          31.7 mm to 18.5 mm as the horn shields the upper surface; on the lower surface the largest drops reach almost to the
+          trailing edge (about −300 mm). Bottom: the mass-weighted mean impact speed \(\sqrt{2\,\dot E_k/\dot m}\): 18–19 m/s at the
+          nose, where the air decelerates the droplets, rising to the 25 m/s freestream at the grazing limits.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="inlet">Is the inlet wide enough and far enough upstream? <span class="level intermediate">Intermediate</span></h2>
+      <p>If the inlet line is too narrow, droplets that would have hit the body are never launched and the water is silently
+        lost. The quadrature cannot see this; the ledger still closes. So before any ice growth, an <strong>inlet-capture
+        audit</strong> runs (<code>icing/validation.py</code>, <code>inlet_capture_audit</code>): for each size bin, it checks
+        whether any captured seed started in the outer 5 % at either end of the inlet, always including the first and last seed.
+        If so, the stage stops (<code>'Collection failed the inlet-guard or positive-capture check'</code> in campaigns). Zero
+        total capture also stops it.</p>
+<pre><code class="language-python">hit=rows[:,2]&gt;=0
+outer=(np.abs(rows[:,1])&gt;=(.5-guard_fraction)*inlet_width)
+outer|=(rows[:,1]==rows[:,1].min())|(rows[:,1]==rows[:,1].max())
+edge=bool(np.any(hit &amp; outer))</code></pre>
+      <div class="code-src">icing/validation.py, inlet_capture_audit()</div>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_inlet_audit.png" alt="Captured seed start offsets per bin relative to inlet guards, and targeted inlet cell widths"></div>
+        <figcaption><b>Figure 6.</b> Left: the audit of RG-15 3.1 shot 7 (<code>collect/audit.json</code>). Each bar is the range of
+          inlet offsets whose seeds hit, per bin; the shaded strips are the 5 % guards of the 0.3 m inlet. All capture lies well
+          inside: guard clear. Right: the targeted cylinder study puts its seeds where they matter. Each dot is one inlet cell of
+          the archived stage-5 partition: 0.25 µm cells across each bin's capture band (dotted: outermost captured seed), about 16 µm
+          outside. Bin 0 is only ±15.6 µm wide and gets its own much finer cells.</figcaption>
+      </figure>
+
+      <div class="callout limits"><div class="callout-title">A clear guard is not a proof</div>
+        <p>The audit's own scope string says it: "Observed inlet-edge capture only; not a convergence certificate." Sampled
+          seeds can miss a narrow island of capture. Upstream distance and inlet width must be varied separately.</p></div>
+
+      <h3>The George upstream study</h3>
+      <p>The project learned this on the George case (<code>runs/george_upstream_wide_return_001/INTERPRETATION.md</code>).
+        Moving the inlet from x = −0.4 m to −0.8 m with the <em>same</em> narrow width lost capture outside the strip's lower edge
+        (gravity and the longer path shifted the capture band). Widening it at unchanged seed spacing recovered 3,732 impacts in
+        the added strips: <strong>41.1 %</strong> of the wider run's captured mass. Seeds in the overlap kept their hit or miss
+        status (one changed panel), so the difference was injection coverage, not droplet physics. The corrected wide run
+        (9,083 impacts, 5.66×10⁻⁵ kg/(m s), guards clear) differs from the original x = −0.4 m result by 0.85 % in panel-mass L1
+        and 0.85 % in kinetic-energy L1. The document is careful to call this bounded sensitivity evidence, not a strict
+        single-variable convergence study.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="refine">Are there enough seeds? <span class="level advanced">Advanced</span></h2>
+      <p>With midpoint quadrature, the seed spacing sets how sharply the capture band edges and the panel-by-panel deposition
+        are resolved. Two tools address this.</p>
+      <h3>Uniform doubling: <code>refined_collect</code></h3>
+      <p><code>icing/collection_refinement.py</code> doubles the seeds per bin and compares each level with the previous one on
+        the identical surface and flow. A comparison passes only if <em>all</em> of these are within the tolerance (default 1 %):
+        the total captured mass change, the panel-mass L1 change, the kinetic-energy L1 change, and the panel-mass L1 change of
+        <em>every</em> bin. It stops when a set number of consecutive comparisons pass (default 2), when capture reaches the inlet
+        guard, or when the seed budget is spent. The L1 norm matters: moving the same water between panels leaves the total
+        unchanged but changes local ice growth (<code>MODELS.md</code>).</p>
+      $$\Delta_{L1} = \frac{\sum_i |\dot m_i^{(2n)} - \dot m_i^{(n)}|}{\sum_i \dot m_i^{(2n)}}$$
+      <h3>Targeted partitions: <code>inlet_quadrature</code></h3>
+      <p>Instead of doubling everywhere, <code>transition_intervals</code> finds where neighbouring seeds change label (hit
+        panel or miss), and <code>refine_partition</code> subdivides only cells overlapping those intervals, keeping all old edges.
+        <code>collect(bin_inlet_edges=...)</code> then uses one partition per bin, each cell weighted by its own width. Its
+        docstring warns: "Equal adjacent labels are not evidence of a constant label between them." A separate global refinement
+        is still needed to catch missed islands.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_seed_refinement.png" alt="Seed refinement evidence: uniform doubling and targeted refinement stages"></div>
+        <figcaption><b>Figure 7.</b> Left: uniform doubling on the CR-4257 cylinder (160 panels,
+          <code>runs/nasa4257_local_seed_refinement_001</code>). The total capture changes by only 0.35 % and then 0.09 %, but the
+          panel-mass L1 change is 5.6 % and then 2.9 %: totals settle long before local \(\beta\). Right: the frozen targeted
+          package (<code>docs/CYLINDER_TARGETED_RETURN.md</code>), with budgets declared before the run: two local refinements, a
+          global bisection of every cell and a halved trajectory step all stay under 1 % (mixture) and 2 % (worst bin). Stage 5 used
+          156,440 seeds and about 3.2 hours.</figcaption>
+      </figure>
+
+      <figure>
+        <div class="frame"><img src="figures/droplets_cylinder_beta.png" alt="Collection efficiency on the CR-4257 cylinder, per bin and total, against digitized measurements"></div>
+        <figcaption><b>Figure 8.</b> What the numerically converged quadrature gives against experiment: stage 5 of the targeted
+          package (<code>deliverables/nasa_cylinder_targeted/results/stage_5/collection.npz</code>) against the digitized CR-4257
+          data. Coloured lines are each bin's contribution (each is already weighted by its mass fraction); black is their sum. The
+          largest bins set the impingement limits (dotted). No shift, smoothing or rescaling was applied. The model is symmetric
+          but the measured curve is not; RMSE is 0.048 and the worst point is −0.126 at −3.2 cm. The velocity is incompressible
+          potential flow (no boundary layer, freestream Mach 0.24), so this does <em>not</em> test the SU2 coupling, and
+          <code>VALIDATION.md</code> assigns no validation pass.</figcaption>
+      </figure>
+
+      <!-- ============================================================ -->
+      <h2 id="energy">Impact kinetic energy and splash <span class="level advanced">Advanced</span></h2>
+      <p>A droplet arriving at speed \(|\mathbf v_\text{imp}|\) brings kinetic energy, which the energy balance counts as a heat
+        source (it is small at 25 m/s but grows with \(U^2\)). Each panel collects</p>
+      $$\dot E_{k,i} = \sum_{\text{seeds}\to i} \dot m_\text{dep}\;\tfrac12|\mathbf v_\text{imp}|^2 \quad[\mathrm{W/m}]$$
+      <p>stored as <code>kinetic_rate</code> next to <code>mass_rate</code>. The seed-refinement test checks it with the same L1
+        tolerance as the mass (Figure 5 bottom shows the resulting mean impact speeds).</p>
+      <h3>Optional splash and bounce: <code>SplashModel</code></h3>
+      <p>Large or grazing droplets can splash or bounce instead of sticking. An optional mass-loss correlation from LEWICE
+        (Wright, NASA/CR-2006-214132) is implemented in <code>SplashModel</code> (<code>splash: {}</code> in a case enables it; it is
+        off in the RG-15 cases):</p>
+      $$K = Oh\,Re^{5/4},\quad K_L = 0.859\sqrt K\,(\rho_w/\mathrm{LWC})^{1/8},\quad K_{L,n} = \frac{K_L}{\sin^{5/4}\theta}$$
+      $$\text{loss} = 0.7\,(1-\sin\theta)\,\big(1-e^{-0.0092(K_{L,n}-200)}\big)\ \ \text{if } K_{L,n}&gt;200,\ \text{else } 0$$
+      <p>where \(\theta\) is the impact angle measured from the surface, \(Re=\rho_w V d/\mu_w\) and
+        \(Oh=\mu_w/\sqrt{\rho_w\sigma d}\). The lost fraction leaves the domain; the deposited part keeps the incoming specific
+        kinetic energy.</p>
+      <figure>
+        <div class="frame"><img src="figures/droplets_splash.png" alt="Splash loss fraction versus impact angle and the splash parameter versus impact speed"></div>
+        <figcaption><b>Figure 9.</b> The correlation evaluated with <code>SplashModel.loss_fraction</code> and
+          <code>parameter</code> at the RG-15 LWC. Left: at 80 m/s, a head-on impact never loses mass; grazing impacts lose up
+          to 70 %, and larger drops start losing at steeper angles. Right: for a normal impact even a 200 µm drop only crosses the
+          threshold above about 90 m/s, so at RG-15's 25 m/s splash is negligible except for grazing impacts.</figcaption>
+      </figure>
+      <div class="callout limits"><div class="callout-title">Splash: an honest reading</div>
+        <p>The docstring records an interpretation problem: the source prints \(K_L\) with \(K\), but taken literally every
+          calibration case would sit far above threshold, so the code uses \(\sqrt K\); "This reading should be checked against
+          LEWICE 3.2 itself before quantitative use." The correlation was calibrated to LEWICE's own collection at 175 mph and lumps
+          splash and bounce; no secondary droplets or re-impingement are tracked.</p></div>
+
+      <!-- ============================================================ -->
+      <h2 id="parallel">Running millions of trajectories: workers and checkpoints <span class="level advanced">Advanced</span></h2>
+      <p>RG-15 tracks 7 × 25,664 = 179,648 seeds per shot; shot 7 took 931 s on 16 workers. Passing an <code>execution</code>
+        object to <code>collect()</code> switches to <code>droplet_execution.execute_seeds</code> (<code>docs/PARALLEL_DROPLETS.md</code>):</p>
+      <ul>
+        <li><strong>Workers.</strong> Separate spawned processes (not threads), each with its own VTK field reader rebuilt from a
+          hashed <em>specification</em> (path, SHA-256, velocity array name, scale). Only fields that can be rebuilt this way
+          (<code>VTKVelocityField</code>, <code>UniformField</code>, <code>CylinderPotentialField</code>) are allowed in parallel.</li>
+        <li><strong>Batches.</strong> Seeds go out in batches (32 in campaigns), one batch per worker in flight; results are
+          reassembled in the original bin/seed order, so the answer is identical to serial (tests compare 1, 2 and 6 workers exactly).</li>
+        <li><strong>Checkpoints.</strong> With a <code>checkpoint_dir</code>, each finished batch is written by
+          <code>droplet_checkpoint.BatchStore</code> as a payload plus a receipt holding its SHA-256, under a folder named by the
+          hash of everything that defines the result (surface, field, seed table, tolerances, code identity). Rerunning the same call
+          reuses committed batches and computes only the missing ones; any change of inputs selects a new folder. An OS file lock
+          prevents two writers.</li>
+        <li><strong>Budgets.</strong> A memory admission check (campaigns allow 85 % of the scheduler allocation) and a per-batch
+          wall-time limit stop the level cleanly, keeping committed batches.</li>
+      </ul>
+<pre><code class="language-python">execution = dict(workers=site['workers'], batch_size=32, checkpoint_dir=str(dest / 'batches'))
+if site.get('memory_mb'):
+    execution['memory_budget_mb'] = .85 * site['memory_mb']
+result = collect(surface, field, **d, execution=execution)
+audit = inlet_capture_audit(result.seed_records, d['inlet_width'])
+if audit['capture_at_guard'] or result.impacted &lt;= 0:
+    raise RuntimeError('Collection failed the inlet-guard or positive-capture check')</code></pre>
+      <div class="code-src">icing/campaign.py, run_collection() (simplified)</div>
+      <p>Related: <code>flow_recovery.solve_with_recovery</code> can store a fully validated completed flow in the same
+        checkpoint area, so a resumed droplet stage does not need to rerun SU2.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="deposit">Putting the water into material <span class="level advanced">Advanced</span></h2>
+      <p>The collection output is a rate per panel. What happens next depends on the ice path (see <a href="thermo.html">Step 5</a>
+        and <a href="growth.html">Step 8</a>), but two modules deal directly with turning captured water into material.</p>
+      <ul>
+        <li><strong><code>deposition_transfer.py</code></strong> (<code>docs/DEPOSITION_TRANSFER.md</code>). When the new ice
+          surface is smoothed, the volume swept by each panel no longer equals the volume its own water would fill. This module
+          finds a sparse, non-negative allocation of each donor panel's new mass and enthalpy to receiving swept cells, minimising
+          the volume-weighted distance, within an explicit neighbourhood (default: same or adjacent panel). It conserves mass and
+          enthalpy exactly, keeps donor materials distinct, and fails rather than reach further. On a saved George increment the
+          mass residual was zero and the enthalpy residual 4.4×10⁻¹⁶ J/m, with 2.6 % of the deposit moved off-diagonal. It is
+          numerical redistribution, not a model of lateral ice flow.</li>
+        <li><strong><code>resolved_deposition.py</code></strong> (<code>grow_resolved_nodal_deposition</code>) carries nodal donor
+          fragments through panel projection and swept geometry into resolved solid cells, each cell keeping every contributing
+          material separately. In the resolved wet-film path (<code>docs/RESOLVED_DROPLET_DEPOSITION.md</code>,
+          <code>collected_phase.advance_collected_phase_mesh_step</code>), incoming mass is the duration times the collected rate
+          and incoming energy is \(\dot m\,c_w(T_d - T_m)\) plus the impact kinetic power, mixed into the top liquid cell. That
+          document is explicit: complete capture and full thermalisation of impact energy are assumed, the mixing is a numerical
+          closure, and no real CFD or validation run was made for that change.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="code">In the code <span class="level advanced">Advanced</span></h2>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <ul>
+          <li><code>icing/droplets.py</code>: <code>drag_acceleration</code>, <code>DropletBin</code>, <code>SplashModel</code>,
+            <code>collect</code>, <code>_track_seed</code>, <code>Collection</code>, <code>UnresolvedDropletError</code>.</li>
+          <li><code>icing/fields.py</code>: <code>VTKVelocityField</code> (native-cell interpolation), <code>CylinderPotentialField</code>
+            (verification only), <code>UniformField</code>.</li>
+          <li><code>icing/validation.py</code>: <code>inlet_capture_audit</code>, <code>collection_metrics</code>.</li>
+          <li><code>icing/collection_refinement.py</code>: <code>SeedRefinement</code>, <code>refined_collect</code>.</li>
+          <li><code>icing/inlet_quadrature.py</code>: <code>transition_intervals</code>, <code>refine_partition</code>.</li>
+          <li><code>icing/droplet_execution.py</code>: <code>DropletExecution</code>, <code>SeedExecutor</code>, <code>execute_seeds</code>.</li>
+          <li><code>icing/droplet_checkpoint.py</code>: <code>BatchStore</code> (content-addressed batches with receipts).</li>
+          <li><code>icing/campaign.py</code>: <code>run_collection</code> (campaign stage, writes <code>forcing.npz</code>).</li>
+          <li><code>icing/deposition_transfer.py</code>, <code>icing/resolved_deposition.py</code>: water into material.</li>
+        </ul></div>
+      <h3>How seeds and their weights are built</h3>
+<pre><code class="language-python">ds = inlet_width / seeds
+offsets = (np.arange(seeds) + .5) * ds - inlet_width / 2         # cell midpoints
+widths = np.full(len(offsets), ds)
+for bin_index, drop in enumerate(bins):
+    inlet_speed = speed if drop.inlet_velocity is None else float(inlet_velocity @ direction)
+    for seed_index, (offset, width) in enumerate(zip(offsets, widths)):
+        tasks.append(dict(bin_index=bin_index, seed_index=seed_index, diameter_m=drop.diameter,
+            initial=np.r_[center + offset * normal, inlet_velocity].tolist(),
+            weight=float(lwc * inlet_speed * width * drop.mass_fraction)))</code></pre>
+      <div class="code-src">icing/droplets.py, collect() (simplified)</div>
+      <p>Before this, <code>collect()</code> checks that the inlet is upstream of the whole surface, that the downstream escape
+        plane lies strictly beyond it (otherwise a future impact could be booked as an escape while the ledger still closes), and
+        that every bin's inlet velocity actually enters through the inlet. Each finished seed produces a record row
+        (bin, inlet offset, panel or −1, mass rate): these <code>seed_records</code> feed the audit and the per-bin refinement checks.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="limits">Assumptions and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li>Dilute, one-way coupled, rigid spherical droplets; no breakup, deformation, turbulent dispersion or in-flight heat
+            transfer. Splash and bounce only through the optional LEWICE correlation.</li>
+          <li>Uniform LWC and uniform droplet velocity across the inlet; gravitational settling slip is not inferred.</li>
+          <li>The downstream crossing is an open-boundary assumption; recirculation that would carry droplets back is not
+            followed beyond it.</li>
+          <li>Seed, inlet width, upstream distance and trajectory step are separate numerical errors. Matching quadratures and a
+            closed ledger do not prove spatial convergence (<code>MODELS.md</code>); campaign collections carry
+            <code>collection_qualified: false</code>.</li>
+          <li>Experimental comparisons so far (CR-4257 cylinder) use potential flow and are not validation passes. The collected
+            water also inherits every error of the CFD field it flies through.</li>
+        </ul></div>
+      <p>Next: the captured water and its energy enter the <a href="thermo.html">freezing energy balance</a>.</p>
+    </article>
+  </main>
+</div>
+</body>
+</html>

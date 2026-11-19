@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Water film and runback · Icing Solver Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="assets/style.css?v=2">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="assets/site.js?v=2"></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar"></aside>
+  <main>
+    <article class="content">
+      <div class="kicker">Step 6 · One icing cycle</div>
+      <h1>Water film and runback</h1>
+      <p class="lede">In glaze conditions not all the water freezes where it lands. The rest forms a film a few micrometres thick that the air drags back along the surface, where it may freeze later. This page explains how the solver moves that water, and why where it ends up decides the shape of glaze ice.</p>
+
+      <div class="toc"><strong>On this page</strong>
+        <ol>
+          <li><a href="#idea">What runback is</a> <span class="level basic">Basic</span></li>
+          <li><a href="#profile">The lubrication film</a> <span class="level basic">Basic</span></li>
+          <li><a href="#rg15">The real forces on the RG-15 wall</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#fv">Moving water between panels</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#demo">A runback demonstration</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#ice">What runback does to ice and film</a> <span class="level intermediate">Intermediate</span></li>
+          <li><a href="#nodal">Runback on the conducting (nodal) path</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#exits">Exits at sharp corners</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#glaze">The glaze film: depth bins, air and breakup</a> <span class="level advanced">Advanced</span></li>
+          <li><a href="#limits">Assumptions and limits</a> <span class="level advanced">Advanced</span></li>
+        </ol>
+      </div>
+
+      <h2 id="idea">What runback is <span class="level basic">Basic</span></h2>
+      <p>On the previous page, each wall panel split its water into ice, vapour and liquid. In rime conditions the liquid part is zero. In glaze conditions it is not: the panel stays at 0 °C and keeps a thin <strong>film</strong> of water. That film does not sit still. Three forces push it along the surface:</p>
+      <ul>
+        <li><strong>air shear</strong>: the air flowing over the film drags its surface along;</li>
+        <li><strong>pressure gradient</strong>: water is pushed from high wall pressure (the stagnation point) towards low pressure;</li>
+        <li><strong>gravity</strong>: its component along the surface.</li>
+      </ul>
+      <p>Water carried from one panel to the next is called <strong>runback</strong>. It can freeze further back on the airfoil than where it landed, which is how glaze builds its typical horns and ridges. The solver therefore alternates two operations in every short substep: move the film (this page), then freeze part of it (<a href="thermo.html">Step 5</a>).</p>
+
+      <figure>
+        <div class="frame diagram-frame">
+        <svg class="diagram" viewBox="0 0 800 335" role="img" aria-label="A thin water film on a wall, pushed by air shear, pressure gradient and gravity, with its lubrication velocity profile">
+          <defs>
+            <marker id="fm-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker>
+            <marker id="fm-w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--warm)"/></marker>
+            <marker id="fm-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ok)"/></marker>
+          </defs>
+          <text x="40" y="36" class="d-muted">air, tens of m/s</text>
+          <path d="M60,62 L740,62" class="d-line" stroke-dasharray="4 4"/>
+          <path d="M60,96 L740,96" class="d-line" stroke-dasharray="4 4"/>
+          <rect x="40" y="250" width="720" height="50" fill="#d9d4cb" stroke="var(--muted)"/>
+          <text x="400" y="281" text-anchor="middle" font-size="14" fill="#333" font-family="Inter, sans-serif">wall (ice or substrate): no slip, u = 0</text>
+          <rect x="40" y="160" width="720" height="90" fill="var(--ok-soft)" stroke="var(--ok)" stroke-width="1.5"/>
+          <text x="372" y="182" class="d-text">water film, thickness h (micrometres)</text>
+          <line x1="120" y1="146" x2="240" y2="146" class="d-arrow" marker-end="url(#fm-a)"/>
+          <text x="120" y="134" class="d-text">① air shear τ on the film surface</text>
+          <line x1="420" y1="212" x2="520" y2="212" stroke="var(--warm)" stroke-width="2.2" marker-end="url(#fm-w)"/>
+          <text x="400" y="238" class="d-text">② −dp/ds: high to low pressure</text>
+          <line x1="640" y1="180" x2="690" y2="228" stroke="var(--ok)" stroke-width="2.2" marker-end="url(#fm-g)"/>
+          <text x="590" y="150" class="d-text">③ gravity ρ g_t</text>
+          <line x1="250" y1="250" x2="250" y2="160" stroke="var(--muted)" stroke-width="1"/>
+          <path d="M250,250 Q 300,215 360,160" stroke="var(--accent)" stroke-width="2.4" fill="none"/>
+          <line x1="250" y1="230" x2="268" y2="230" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#fm-a)"/>
+          <line x1="250" y1="205" x2="295" y2="205" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#fm-a)"/>
+          <line x1="250" y1="180" x2="334" y2="180" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#fm-a)"/>
+          <text x="40" y="325" class="d-muted">④ velocity grows from zero at the wall: u(z) = [τ z + F (h z − z²/2)] / μ,  F = ρ g_t − dp/ds</text>
+        </svg>
+        </div>
+        <figcaption><b>Figure 1.</b> The film model. ① The air shear acts on the film surface. ② The wall pressure gradient and ③ the tangential part of gravity act on every bit of water inside the film; the solver combines them into one force per volume \(F = \rho_w g_t - dp/ds\). ④ The water sticks to the wall and moves fastest at its surface. The drawing is not to scale: the real film is micrometres thick, under air moving at tens of metres per second.</figcaption>
+      </figure>
+
+      <div class="callout plain"><div class="callout-title">In plain words</div>
+        <p>The film is so thin and slow that it behaves like honey between a fixed plate (the wall) and a moving one (the air). Its velocity can be written down exactly. From it follows how many kilograms per second cross each panel edge. The solver moves the water panel to panel with that flux, in small time steps, never losing or creating a drop.</p></div>
+
+      <h2 id="profile">The lubrication film <span class="level basic">Basic</span></h2>
+      <p>The film is thin (micrometres) and slow (millimetres to centimetres per second), so inertia does not matter: viscous stress balances the applied forces at each height \(z\) above the wall. MODELS.md writes this local momentum balance as</p>
+      $$ \mu\, \frac{\partial^2 u}{\partial z^2} + F = 0, \qquad u(0) = 0, \qquad \mu \frac{\partial u}{\partial z}\Big|_{z=h} = \tau , $$
+      <p>with \(\mu\) the water viscosity (\(1.792\times10^{-3}\) Pa s, <code>MU_W</code> in <code>icing/thermo.py</code>), \(h\) the film thickness and \(\tau\) the air shear. The two conditions say the water does not slip on the wall and the air drags the film surface with stress \(\tau\). Solving gives the velocity profile, written in <code>profile_runback.transport_liquid_profile()</code> as</p>
+      $$ u(z) = \frac{\tau z + F\,(h z - z^2/2)}{\mu}. $$
+      <p>Integrating over the depth and multiplying by the water density gives the mass flux per metre of span, the formula at the heart of all runback in the solver (<code>thermo.accrete()</code> docstring):</p>
+      $$ q = \rho_w \left[ \frac{\tau h^2}{2\mu} + \frac{F h^3}{3\mu} \right], \qquad F = \rho_w g_t - \frac{dp}{ds}. $$
+      <p>The shear part grows with \(h^2\), the pressure-and-gravity part with \(h^3\). For thin films shear dominates; for thicker films the pressure gradient catches up.</p>
+
+      <figure>
+        <div class="frame"><img src="figures/film_velocity_profiles.png" alt="Velocity profiles in a 10 micrometre film for three force combinations, and flux versus film thickness"></div>
+        <figcaption><b>Figure 2.</b> Left: the profile \(u(z)\) in a 10 µm film. A: shear only gives a straight line (Couette flow). B: a favourable pressure gradient adds a parabola and speeds the film up. C: an adverse gradient pushes back. ① Near the wall the water then flows backwards while the surface still moves forward. ② In case A the surface moves at \(\tau h/\mu\) = 28 mm/s, the mean speed is half of that. Right: the two flux terms for case C. ③ Below about 10.7 µm shear wins and the net flux is forward; above it the \(h^3\) pressure term wins and the film runs backwards. Values are illustrative but within the range of the real RG-15 wall in Figure 3.</figcaption>
+      </figure>
+
+      <h2 id="rg15">The real forces on the RG-15 wall <span class="level intermediate">Intermediate</span></h2>
+      <p>The shear and pressure come from the CFD solution (<a href="airflow.html">Step 3</a>). <code>fields.wall_fields()</code> projects the SU2 skin-friction vector onto each panel's tangent, so the sign of \(\tau\) says in which direction along the surface the air drags. Figure 3 shows the forcing on the iced RG-15 airfoil in shot 6 of case 3.2.</p>
+      <figure>
+        <div class="frame"><img src="figures/film_rg15_forcing.png" alt="Wall shear, pressure gradient and film flux components along the iced RG-15 leading edge"></div>
+        <figcaption><b>Figure 3.</b> Forcing along the iced leading edge, from <code>results_32/shot_06/flow/surface_flow.vtu</code>. Top: wall shear. It changes sign several times around the stagnation region and the horns (wall shear ranges from −26.2 to +14.7 Pa on this wall); where it points towards a point from both sides, water converges. Middle: the pressure-gradient force on a symmetric-log scale. Thin grey: each panel's own pressure difference; orange: the secant slope over the clean wall's design spacing (<code>nodal_loads.panel_pressure_gradient()</code> with <code>film_forcing_length: "design"</code>); dashed: gravity. Bottom: the two flux contributions for a 5 µm film. Shear carries most of the water; the pressure term matters only at the few spots where the gradient is around \(10^6\) Pa/m.</figcaption>
+      </figure>
+      <p>The spiky pressure gradient has a story. Wall refinement inserts short panels between the sharp facet corners of the polygonal ice shape, and the CFD returns a suction spike at every such corner. PHYSICS_REVIEW.md (2026-11-14) records nodal gradients of \(\pm10^6\) to \(5\times10^6\) Pa/m with alternating sign on 73–85 µm panels. The lubrication model has no surface tension, which in a real film would smooth such short-wavelength forcing. Without it, the model once collected water in the "wells" between corners until it stood 0.77 mm deep, and the transport time step collapsed. The fix is a low-pass filter on the forcing: on panels shorter than the clean wall's design spacing, <code>panel_pressure_gradient()</code> takes the secant slope of the wall pressure over a window of that length. The docstring is candid that this is "a low-pass filter of the forcing, not a capillary model". On the shot-6 wall the panels are 26 to 1040 µm long and the design spacing 220 to 1000 µm; within ±15 mm of the stagnation panel the filter lowers the root-mean-square gradient only from \(5.4\times10^5\) to \(4.5\times10^5\) Pa/m, and the largest value stays about \(4\times10^6\) Pa/m. The filter removes cell-scale forcing; it does not remove gradients resolved over the design spacing.</p>
+
+      <h2 id="fv">Moving water between panels <span class="level intermediate">Intermediate</span></h2>
+      <p>The wall is a closed polygon of panels. Each panel stores its film as a <em>mass</em> per metre of span, not as a thickness; the thickness is reconstructed as \(h = M/(\rho_w L)\) with \(L\) the panel length (MODELS.md). Water moves through the vertices that join neighbouring panels. This is a <strong>finite-volume</strong> method: what leaves one panel through a face enters the next one, so the total is conserved to rounding error.</p>
+      <div class="callout code"><div class="callout-title">Where it lives</div>
+        <p>Panel path: <code>icing/thermo.py</code> → <code>accrete()</code> (transport loop) and <code>film_energy.transport_film_energy()</code> (optional sensible energy). Nodal path: <code>icing/nodal_phase.py</code> → <code>NodalBoundary.transport()</code>, driven by <code>nodal_increment.advance_nodal_increment()</code> inside the coupling step <code>nodal_coupling.advance_coupled_nodal_step()</code>; loads from <code>nodal_loads.nodal_loads_from_snapshot()</code>; wall changes via <code>film_remap.remap_surface_film()</code>. Glaze path: <code>profile_runback.transport_liquid_profile()</code>, <code>phase_column_runback.transport_phase_columns()</code>, <code>film_air.py</code>, <code>film_breakup.py</code>, <code>runback_exits.py</code>.</p></div>
+      <p>The flux through each face comes from the lubrication formula, evaluated on both sides and blended with a <strong>Rusanov</strong> (local Lax–Friedrichs) flux:</p>
+      $$ q_{i+1/2} = \tfrac12\big[q(h_i) + q(h_{i+1})\big] - \tfrac12\, a_{i+1/2}\, \rho_w\, (h_{i+1} - h_i), \qquad a = \frac{|\tau|\,h_\text{max}}{\mu} + \frac{|F|\,h_\text{max}^2}{\mu}. $$
+      <p>\(a\) is an upper bound on the speed at which a change in thickness travels along the film (the derivative of \(q/\rho_w\) with respect to \(h\), bounded with the larger of the two thicknesses). The second term adds just enough numerical smoothing to keep the method stable whichever way the forces point, including where shear and gravity compete.</p>
+<pre><code class="language-python">while elapsed &lt; dt * (1 - 1e-14):
+    height = water / (RHO_W * length)
+    # Local Lax-Friedrichs/Rusanov flux handles shear/gravity competition.
+    h_right = np.roll(height, -1)
+    flux_l = RHO_W * (tau * height**2 / (2*MU_W) + force * height**3 / (3*MU_W))
+    flux_r = RHO_W * (tau * h_right**2 / (2*MU_W) + force * h_right**3 / (3*MU_W))
+    hmax = np.maximum(height, h_right)
+    wave = np.abs(tau) * hmax / MU_W + np.abs(force) * hmax**2 / MU_W
+    flux = .5 * (flux_l + flux_r) - .5 * wave * RHO_W * (h_right - height)
+    cfl_dt = np.min(.45 * length / np.maximum(wave + np.roll(wave, 1), 1e-30))
+    step = min(dt - elapsed, max_substep, cfl_dt)
+    incoming = step*(np.maximum(np.roll(flux,1),0)+np.maximum(-flux,0))
+    outgoing = step*(np.maximum(flux,0)+np.maximum(-np.roll(flux,1),0))
+    runback_in += incoming
+    runback_out += outgoing
+    water += incoming-outgoing
+    if np.min(water) &lt; -1e-14:
+        raise RuntimeError('Negative film mass after transport')
+    ...                                   # then the phase solve on every panel
+</code></pre>
+      <div class="code-src">icing/thermo.py, accrete() transport loop (simplified)</div>
+      <ul>
+        <li><code>tau</code> and <code>force</code> live on faces: <code>accrete()</code> averages the two adjacent panels' signed shear and tangential gravity, and takes the pressure gradient as the difference of adjacent panel-centre pressures divided by the distance between the centres. Only pressure differences enter, so adding a constant to the pressure changes nothing (MODELS.md).</li>
+        <li><code>np.roll(..., -1)</code> is the neighbour downstream in surface order; the face \(i+\tfrac12\) joins panel \(i\) to \(i+1\), and the last panel joins the first. That is the closed, periodic topology.</li>
+        <li>The <strong>CFL condition</strong> picks the substep: no wave may cross more than 0.45 of a panel, counting both of its faces. Thicker water or shorter panels mean smaller steps. A hard cap (<code>max_substeps</code>, 200,000) stops a run whose step collapses ("Film transport substep limit exceeded").</li>
+        <li><code>incoming</code> and <code>outgoing</code> are gross transfers, accumulated as <code>runback_in</code> and <code>runback_out</code>: the per-panel ledger and the freezing fraction of <a href="thermo.html#mass">Step 5</a> use them.</li>
+      </ul>
+      <div class="callout why"><div class="callout-title">Why positivity matters</div>
+        <p>A film cannot have negative mass. The Rusanov flux with this CFL limit keeps every panel non-negative in exact arithmetic (MODELS.md: "conserve mass and protect positivity"). The code still checks: anything below \(-10^{-14}\) kg/m raises instead of being silently clipped, and tiny rounding negatives are set to zero. After the whole interval, the global ledger (initial film + impingement = ice + film + evaporation) and the per-panel ledger must each close to \(10^{-10}\) of the supplied water, or <code>accrete()</code> raises.</p></div>
+
+      <h2 id="demo">A runback demonstration <span class="level intermediate">Intermediate</span></h2>
+      <p>To watch the transport alone, the script below calls the real <code>thermo.accrete()</code> on a toy circular wall (radius 20 mm, 400 panels) in a configuration where nothing can freeze: air and droplets exactly at \(T_m\), no air speed for recovery heating, no evaporation. The phase solve then returns zero ice and the film is pure transported water. Water is injected near the front with a cylinder-like collection efficiency (\(0.8\cos\theta\) within ±60°, times 0.52 g/m³ × 25 m/s, the RG-15 values), and the shear \(\tau = 10\sin\theta\) Pa pushes it away from the front stagnation point on both sides. Both distributions are illustrative inputs, not a CFD solution.</p>
+      <figure class="wide">
+        <div class="frame"><img src="figures/film_runback_demo.png" alt="Film thickness around a cylinder at several times, and mass conservation check"></div>
+        <figcaption><b>Figure 4.</b> Left: film thickness around the toy cylinder. ① At the stagnation point the shear is zero, so the film is thickest in the impingement zone; it settles at a steady 8.6 µm after about 4 s (the 4 s and 8 s curves coincide), when runback carries away exactly what arrives. ② Early on, the wet front advances into the dry wall at a finite speed (here the t = 1 s front). ③ Where the shear from both sides converges (the rear, ±180°), the water has nowhere to go: the closed wall with no shedding model piles it up (about 4,300 µm after 16 s, off scale). Right: the mass ledger. Injected water and water on the wall coincide; their difference (orange, right axis) stays at the level of floating-point rounding (largest 7.5 × 10<sup>−16</sup> kg/m against about 6 g/m of water; points at the bottom are exactly zero). The CFL substeps per quarter second grow from 13 at the start to 1206 at the end, because the wave speed grows with the depth of the rear pool.</figcaption>
+      </figure>
+      <p>Point ③ is not a numerical accident. MODELS.md states it directly: "there is currently no trailing-edge shedding model. Water reaching the base of a blunt trailing edge can remain or pass around it". The same convergence happens on real iced airfoils at a separation line behind a horn, where PHYSICS_REVIEW.md (2026-11-14, diagnostic D1) found runback water collecting up to 1.2 mm deep. The exits and stripping described in the advanced sections are the solver's responses.</p>
+
+      <h2 id="ice">What runback does to ice and film <span class="level intermediate">Intermediate</span></h2>
+      <p>Now with freezing. The same <code>accrete()</code> runs for 1 s at the case 3.2 temperature on the real shot-6 wall, with real HTC, impingement, shear, pressure and gravity, starting from a dry wall. A second run switches runback off (zero shear, pressure and gravity), so every drop must freeze or wait where it landed. One second is short, but long enough to show the pattern; longer runs on this wall slow down sharply, for a reason that is itself the point of this section (below).</p>
+      <figure>
+        <div class="frame"><img src="figures/film_ice_runback.png" alt="Ice formation rate and film thickness along the RG-15 leading edge with and without runback"></div>
+        <figcaption><b>Figure 5.</b> Real shot-6 wall at 269.15 K, 1 s of <code>thermo.accrete()</code>. Top: ice formation rate, with runback (blue) and without (grey); dotted: impingement. On wet panels the two curves coincide: a panel held at 0 °C freezes exactly what its cooling allows, however much water it has. ① Runback changes the ice only where a panel had cooling to spare, typically a dry-branch panel next to wet ones: at −2.1 mm, for example, it freezes 7.6 g/(m² s) of ice from 4.3 g/(m² s) of impingement, the largest excess on this wall. Total ice rises by only 1.6 % in this second. Bottom: the film. Without runback it mirrors the local surplus (up to 6.6 µm). With runback it is drained from most panels and collects in peaks: ② 17 µm at −0.16 mm and ③ about 8 µm at +7.6 mm, where the wall shear in Figure 3 changes sign and pushes water together from both sides.</figcaption>
+      </figure>
+      <p>The peaks keep growing. A diagnostic run on the same wall and temperature, with shear only (no pressure gradient or gravity) and continued in quarter-second calls, put the deepest film beside the stagnation panel at 1.9, 7.9, 15.4 and 23.1 µm after 0.25, 0.5, 0.75 and 1 s, while the transport substeps per quarter second rose from 27 to 228, because the CFL step shrinks as the pool deepens. This is the panel-path version of what the glaze campaigns met on the horn (PHYSICS_REVIEW.md, 2026-11-14): a lubrication film has no way to leave a line where the shear converges, so water accumulates there until something else (freezing, exits, stripping) removes it.</p>
+      <div class="callout limits"><div class="callout-title">Which path is this</div>
+        <p>Figures 4 and 5 use the panel path (<code>thermo.accrete</code>). The rime campaigns use the nodal transport below; the glaze campaigns use the depth-resolved transport of the phase-aware path. The physics of the flux is the same lubrication law in all three.</p></div>
+
+      <h2 id="nodal">Runback on the conducting (nodal) path <span class="level advanced">Advanced</span></h2>
+      <p>When the ice and airfoil are a conducting finite-element solid, the film lives on the solid's wall nodes instead of on panels: each wall node owns a <em>dual cell</em> made of half of each adjacent boundary edge. <code>nodal_phase.NodalBoundary.transport()</code> applies the same lubrication flux and Rusanov blend across each boundary edge, with a CFL step based on the sum of wave speeds into each dual cell. The loads are prepared by <code>nodal_loads.nodal_loads_from_snapshot()</code>: shear signed along each edge, and the edge force \(\rho_w g_t - dp/ds\) with the pressure taken linear along each original CFD panel, so that split solid edges need no extrapolation.</p>
+<pre><code class="language-python">while elapsed&lt;dt:
+    height=mass/(RHO_W*self.lengths)
+    left,right=height[a],height[b]
+    high=np.maximum(left,right)
+    wave=(abs(tau)*high+abs(force)*high**2)/MU_W
+    flux=lambda h: RHO_W*(tau*h*h/(2*MU_W)+force*h**3/(3*MU_W))
+    rate=.5*(flux(left)+flux(right))-.5*wave*RHO_W*(right-left)
+    wave_sum=np.bincount(self.edges.ravel(),weights=np.repeat(wave,2),minlength=len(mass))
+    step=min(dt-elapsed,float(np.min(.45*self.lengths/np.maximum(wave_sum,1e-30))))
+    moved=step*rate
+    # outlets: each side discharges only outward; nothing crosses the cut
+    left_loss=np.where(outlets,step*np.maximum(flux(left),0.),0.)
+    right_loss=np.where(outlets,step*np.maximum(-flux(right),0.),0.)
+    moved[outlets]=0.
+    ...
+    if energy is not None:      # sensible energy rides with the donor's mass
+        specific=np.divide(energy,mass,out=np.zeros_like(energy),where=mass&gt;0)
+        ...
+    mass=mass-outgoing+incoming
+</code></pre>
+      <div class="code-src">icing/nodal_phase.py, NodalBoundary.transport() (simplified)</div>
+      <p><code>advance_nodal_increment()</code> (<code>icing/nodal_increment.py</code>) calls this transport, then the coupled phase solve, in every thermal substep (5 ms in the RG-15 campaigns, <code>thermal_step</code> in the case files). It checks that film + ice + evaporation + runoff equals initial film + impingement to \(10^{-10}\).</p>
+      <p>When the wall changes shape, the film must follow. <code>film_remap.remap_surface_film()</code> transfers each old dual-cell inventory onto the new dual cells by the overlap of normalised panel arclength, with weights that sum to one for every donor, so mass and sensible energy are conserved exactly ("Film remap conservation audit failed" otherwise). Its docstring warns that this first-order projection can mix donor temperatures and is not a flow model.</p>
+
+      <h3>Verification of the nodal transport</h3>
+      <p>NODAL_RUNBACK_VERIFICATION.md records two independent checks against exact solutions of the thickness equation \(h_t + \partial_s[\tau h^2/(2\mu) + F h^3/(3\mu)] = 0\), on a periodic 4 m loop with 32 to 256 dual cells:</p>
+      <ul>
+        <li><strong>Smooth film</strong> solved by characteristics. Mean thickness errors fall by ratios 0.496, 0.499, 0.500 (shear case) and 0.507, 0.503, 0.501 (opposing shear and force) per doubling: first-order convergence, as predicted, with zero mass residual (<code>runs/nodal_runback_characteristics_001/report.json</code>).</li>
+        <li><strong>Wet patch advancing into dry wall</strong>, against the exact shock-and-rarefaction solution. L1 error ratios 0.698, 0.668, 0.502 (shear) and 0.655, 0.482, 0.583 (body force); mass residual at most \(2.8\times10^{-17}\) kg/m; the film stays non-negative and below its initial height (<code>runs/nodal_dry_front_001/report.json</code>).</li>
+      </ul>
+      <p>The document is clear about what these do not establish: contact-line physics, capillarity, freezing/runback splitting accuracy or realistic icing behaviour.</p>
+
+      <h2 id="exits">Exits at sharp corners <span class="level advanced">Advanced</span></h2>
+      <p>A closed wall keeps all its water (Figure 4, ③). A real airfoil sheds water at its trailing edge. The solver models this with prescribed <strong>absorbing cuts</strong> (RUNBACK_EXITS.md). At a cut, each side discharges only its own outward lubrication flux, \(\max(q(h_a), 0)\) from one side and \(\max(-q(h_b), 0)\) from the other; no water crosses the cut and none enters from outside. The escaping water takes its sensible enthalpy with it, and both are recorded (<code>runoff_mass</code>, <code>runoff_energy</code>) so the ledgers still close.</p>
+      <p>On the glaze campaign path, <code>"outlet_panels": "sharp_corners"</code> finds the cuts automatically (<code>icing/runback_exits.py</code>). <code>corner_vertices()</code> marks convex vertices of the <em>clean</em> wall whose exterior turning angle is at least 60°; <code>sharp_corner_outlets()</code> cuts the two panels meeting at each such corner on the current surface, but only while the wall there is still clean (the vertex and both clean neighbours are present). Sharp features of the ice shape are never exits.</p>
+      <figure>
+        <div class="frame"><img src="figures/film_exits.png" alt="Detected sharp corners of the clean RG-15 wall and the exit panels at the trailing-edge base"></div>
+        <figcaption><b>Figure 6.</b> Left: the clean RG-15 wall from the campaign's recorded clean surface (890 vertices) with the vertices <code>corner_vertices()</code> finds (red): the two corners of the 2 mm blunt trailing-edge base. Right: zoom on the base of the shot-6 surface. The exit panels returned by <code>sharp_corner_outlets()</code> are drawn thick green, with a red tick at each panel's midpoint, where the cut sits. Only the upper corner (clean vertex 0, dot) gets an exit. The lower corner (clean vertex 883, cross) is skipped: neither it nor its lower neighbour exists at its clean coordinates in the shot-6 surface, so <code>sharp_corner_outlets()</code> lists it under <code>skipped_clean_corners</code>. The campaign ledger records the same for shots 5 and 6 (<code>exit_corners</code> in <code>ice/summary.json</code> and <code>progress.json</code>), so in case 3.2 water reaching the lower base corner had no exit.</figcaption>
+      </figure>
+      <div class="callout limits"><div class="callout-title">An exit is not a detachment law</div>
+        <p><code>runback_exits.py</code> states it plainly: the cut is "the quasi-steady limit in which everything that arrives is shed. It is not a force balance." For icing films the film Weber number \(\rho u^2 h/\sigma\) is of order \(10^{-4}\), so a film would not leave a corner by inertia; real shedding happens by pooling and intermittent stripping of beads. Water that should physically pool and freeze at the corner is removed instead. The basis in NASA's GlennICE SWIM study supports the lubrication profile, not this particular exit condition.</p></div>
+
+      <h2 id="glaze">The glaze film: depth bins, air and breakup <span class="level advanced">Advanced</span></h2>
+      <p>The glaze campaigns (the phase-aware path of <a href="glaze.html">Step 10</a>) store water and ice in vertical <em>columns</em> on each wall node. Only the fully liquid part of a column that is open to the air, the "mobile cap", runs back: <code>phase_column_runback.transport_phase_columns()</code> keeps crusts and enclosed water in place and hands the cap to <code>profile_runback.transport_liquid_profile()</code>.</p>
+      <h3>Depth-resolved transport</h3>
+      <p><code>transport_liquid_profile()</code> splits the film into equal-mass depth bins (four in the RG-15 campaigns, <code>depth_cells</code>). Each bin moves with the integral of \(u(z)\) over its own height, so a counterflowing film (Figure 2, case C) sends its bottom bins one way and its top bins the other. Each bin carries its own sensible energy with its own donor mass. After each substep the bins are re-cut to equal mass conservatively (<code>_rebin()</code>). The time step is set by donor positivity: no bin may export more than 0.45 of its mass in one substep. PHYSICS_REVIEW.md ("Resolved-profile runback approximation") calls this a first-order layer model that can mix vertical structure; there is no vertical conduction or phase change inside the transport.</p>
+      <p>Two validity controls protect it on refined iced walls (PHYSICS_REVIEW.md, 2026-11-14), both used by case 3.2: <code>film_forcing_length: "design"</code> (the forcing filter above) and <code>film_inertial_limit: true</code>, which caps each donor's speed at the speed water could reach from rest under the work done over one edge, \(\sqrt{2W/\rho_w}\). For ordinary thin films the cap factor is exactly one; it only slows deep, pooled water, for which lubrication would predict hundreds of metres per second.</p>
+
+      <h3>Where the film really is</h3>
+      <figure class="wide">
+        <div class="frame"><img src="figures/film_glaze_state.png" alt="Liquid film rows on the iced RG-15 leading edge from the saved glaze state"></div>
+        <figcaption><b>Figure 7.</b> Saved glaze state of case 3.2 at t = 926 s (shot 6, <code>results_32/shot_06/ice/slot_0/history.json</code>; the liquid is computed with <code>PhaseColumns.phase()</code>). Left: clean RG-15 (grey) and the iced wall (blue), with the wall nodes that hold liquid coloured by film thickness. Right: liquid film thickness per wall node. 48 of 1039 wall nodes hold liquid, 3.0 × 10<sup>−4</sup> kg/m in total. 34 of them carry less than 10 µm, a thin film spread over the lower side of the stagnation region. Further back, about 9 to 12 mm along the lower surface, the water stands up to 162 µm deep. The shot-6 wall shear of Figure 3 changes sign near 9.3 mm (positive before, negative after), so the air drives water into this band from both sides: the convergence that PHYSICS_REVIEW.md (2026-11-14, diagnostic D1) identified as the cause of runback pooling.</figcaption>
+      </figure>
+
+      <h3>Film in the air's inner layer, and stripping</h3>
+      <p>The basic model applies the CFD <em>wall</em> shear to the film surface. <code>film_air.py</code> (opt-in <code>film_air_coupling</code>, on in case 3.2) refines this with three statements from its docstring. First, near the wall the air's shear stress varies as \(\tau(y) = \tau_w + y\,dp/ds\), so the stress on a film of depth \(h\) is \(\tau(h)\), not \(\tau_w\). At a separation point, where \(\tau_w = 0\), this gives a net downstream flux \(q/\rho_w = (dp/ds)\,h^3/(6\mu_w)\) instead of none. Second, that law is used only up to a cap height where it stops being valid (velocity maximum, edge speed, or backflow without adverse gradient). Third, water standing up into fast air is torn off where the height Weber number \(\rho_\text{air}\,u(h)^2 h/\sigma\) exceeds 2. The number 2 comes from a pressure balance with an assumed crest shape and is "known only to a factor of a few"; <code>strip_weber</code> is exposed so the sensitivity can be tested.</p>
+
+      <h3>Breakup into rivulets</h3>
+      <p><code>film_breakup.py</code> implements the minimum-total-energy (MTE) criterion: a film breaks into rivulets when a rivulet pattern carrying the same flow has lower kinetic plus surface energy. The critical thickness falls with shear as \(\tau^{-2/3}\). It is opt-in and off in case 3.2, because Gosset (2017) found MTE thresholds well above films that were observed to stay continuous on a NACA 0012 (GLAZE_SWIM.md).</p>
+      <figure>
+        <div class="frame"><img src="figures/film_thresholds.png" alt="MTE breakup thickness and aerodynamic stripping depth versus shear, compared with real film thickness"></div>
+        <figcaption><b>Figure 8.</b> Thresholds computed with the real code: <code>FilmBreakup.critical_thickness()</code> for three contact angles (orange) and <code>AirInnerLayer.strip_depth()</code> for zero pressure gradient and two edge speeds (blue). At 5 Pa the MTE threshold is 210 µm for a 45° contact angle; the stripping depth is 185 µm at 25 m/s. Both lie one to two orders of magnitude above the thin film that covers most wet rows of the saved glaze state (green band), so neither mechanism acts on an ordinary glaze film. The deepest pool of that state (162 µm, dash-dot) is of the same order as both thresholds: they matter exactly where water pools, as at separation lines. At 25 m/s and above about 2 Pa the stripping depth is the edge-speed limit \(2\sigma/(
+ho_\text{air}U_e^2)\), independent of shear.</figcaption>
+      </figure>
+
+      <h3>Freezing inside the film</h3>
+      <p>How the glaze columns freeze from the wall upward is the subject of <a href="glaze.html">Step 10</a>. For orientation: <code>liquid_freezing.freeze_liquid_columns()</code> withdraws liquid from the bottom up for a given heat budget; <code>film_thermal_freezing.advance_film_thermal_freezing()</code> connects liquid-column conduction and solid contact to that withdrawal and to conforming ice growth; and the campaign setting <code>film_ice_settling</code> places ice formed inside the film at its base, the Messinger/SWIM assumption that ice grows under a flowing film (GLAZE_SWIM.md, "Sharp basal freezing front").</p>
+
+      <h2 id="limits">Assumptions and limits <span class="level advanced">Advanced</span></h2>
+      <div class="callout limits"><div class="callout-title">Assumptions and limits</div>
+        <ul>
+          <li><strong>Lubrication.</strong> Valid for thin, slow films whose forcing varies over lengths much larger than the film depth. No inertia (except the opt-in speed cap), no surface tension or capillary levelling, no contact angle, no contact-line physics.</li>
+          <li><strong>First order.</strong> The Rusanov scheme is first order in space; the transport/freezing splitting is first order in time. Verification shows the expected first-order convergence, not more.</li>
+          <li><strong>Closed wall by default.</strong> Without exits, water stays on the wall (no shedding). Exits are prescribed absorbing cuts, not a detachment prediction; stripped water is not tracked further (no re-impingement).</li>
+          <li><strong>Constant water properties</strong> (viscosity of water near 0 °C) and no mechanical work or viscous heating in the thermal balance (MODELS.md).</li>
+          <li><strong>Rivulets</strong>: the MTE closure is unvalidated for sheared films and off by default.</li>
+          <li><strong>Verified, not validated.</strong> The transport converges to exact solutions of its own equations. Whether the real film on an iced RG-15 behaves like this has not been tested against experiment.</li>
+        </ul></div>
+    </article>
+  </main>
+</div>
+</body>
+</html>
